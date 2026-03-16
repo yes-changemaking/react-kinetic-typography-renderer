@@ -17,6 +17,24 @@ const PREVIEW_STATE_LABELS = {
   error: "Preview error",
 };
 
+const EXPORT_STATE_LABELS = {
+  idle: "Ready",
+  preparing: "Preparing export...",
+  recording: "Recording frames...",
+  muxing: "Finalizing video blob...",
+  done: "Export complete",
+  error: "Export error",
+};
+
+const EXPORT_MIME_CANDIDATES = {
+  webm: [
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm",
+  ],
+  mp4: ["video/mp4;codecs=avc1.42E01E,mp4a.40.2", "video/mp4"],
+};
+
 function formatTime(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
 
@@ -24,6 +42,47 @@ function formatTime(seconds) {
   const minutes = Math.floor(totalSeconds / 60);
   const remainderSeconds = totalSeconds % 60;
   return `${minutes}:${String(remainderSeconds).padStart(2, "0")}`;
+}
+
+function clamp01(value) {
+  return Math.min(Math.max(value, 0), 1);
+}
+
+function sanitizeFileBaseName(name) {
+  return (name || "kinetic-typography")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-z0-9_-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase();
+}
+
+function waitForAudioMetadata(audioElement) {
+  return new Promise((resolve, reject) => {
+    if (audioElement.readyState >= 1 && Number.isFinite(audioElement.duration)) {
+      resolve();
+      return;
+    }
+
+    const handleLoadedMetadata = () => {
+      cleanup();
+      resolve();
+    };
+
+    const handleAudioError = () => {
+      cleanup();
+      reject(new Error("Audio file could not be loaded."));
+    };
+
+    const cleanup = () => {
+      audioElement.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      audioElement.removeEventListener("error", handleAudioError);
+    };
+
+    audioElement.addEventListener("loadedmetadata", handleLoadedMetadata);
+    audioElement.addEventListener("error", handleAudioError);
+    audioElement.load();
+  });
 }
 
 function wrapTextToLines(ctx, text, maxWidth) {
@@ -64,18 +123,193 @@ function wrapTextToLines(ctx, text, maxWidth) {
 function getVisibleCharacterCount(text, currentTime, duration) {
   if (!text) return 0;
   if (!Number.isFinite(duration) || duration <= 0) return text.length;
+  return Math.floor(clamp01(currentTime / duration) * text.length);
+}
 
-  const progress = Math.min(Math.max(currentTime / duration, 0), 1);
-  return Math.floor(progress * text.length);
+function pickSupportedMimeType(format) {
+  if (typeof window === "undefined") return null;
+  if (typeof window.MediaRecorder === "undefined") return null;
+
+  const candidates = EXPORT_MIME_CANDIDATES[format] ?? EXPORT_MIME_CANDIDATES.webm;
+  const { isTypeSupported } = window.MediaRecorder;
+
+  if (typeof isTypeSupported !== "function") {
+    return candidates[0] ?? null;
+  }
+
+  return candidates.find((mimeType) => isTypeSupported(mimeType)) ?? null;
+}
+
+function drawTypewriterMode({
+  ctx,
+  scriptText,
+  currentTime,
+  duration,
+  isPlaying,
+  maxTextWidth,
+  timelineBottomSpace,
+}) {
+  const visibleCharacters = getVisibleCharacterCount(scriptText, currentTime, duration);
+  const visibleText = scriptText.slice(0, visibleCharacters);
+  const lineHeightPx = CANVAS_FONT_SIZE * CANVAS_LINE_HEIGHT;
+  const maxLines = Math.max(
+    1,
+    Math.floor(
+      (CANVAS_HEIGHT - CANVAS_PADDING * 2 - timelineBottomSpace) / lineHeightPx
+    )
+  );
+
+  ctx.fillStyle = "#f8fafc";
+  ctx.font = `700 ${CANVAS_FONT_SIZE}px "Segoe UI", "Inter", sans-serif`;
+  ctx.textBaseline = "top";
+
+  const wrappedLines = wrapTextToLines(ctx, visibleText, maxTextWidth);
+  const drawableLines = wrappedLines.slice(0, maxLines);
+  let yPosition = CANVAS_PADDING;
+
+  for (const line of drawableLines) {
+    ctx.fillText(line, CANVAS_PADDING, yPosition);
+    yPosition += lineHeightPx;
+  }
+
+  if (isPlaying && visibleCharacters < scriptText.length) {
+    const shouldBlink = Math.floor(currentTime * 2) % 2 === 0;
+    if (shouldBlink) {
+      const currentLine = drawableLines[drawableLines.length - 1] ?? "";
+      const cursorX = CANVAS_PADDING + ctx.measureText(currentLine).width + 6;
+      const cursorY =
+        CANVAS_PADDING + Math.max(drawableLines.length - 1, 0) * lineHeightPx;
+
+      ctx.fillStyle = "#22d3ee";
+      ctx.fillRect(cursorX, cursorY + 8, 6, CANVAS_FONT_SIZE - 12);
+    }
+  }
+}
+
+function drawKaraokeMode({ ctx, scriptText, currentTime, duration, maxTextWidth }) {
+  const words = scriptText
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+
+  if (!words.length) return;
+
+  const progress = duration > 0 ? clamp01(currentTime / duration) : 1;
+  const currentWordIndex = Math.min(
+    words.length - 1,
+    Math.floor(progress * words.length)
+  );
+
+  const windowSize = 8;
+  let startIndex = Math.max(0, currentWordIndex - Math.floor(windowSize / 2));
+  let endIndex = Math.min(words.length, startIndex + windowSize);
+  startIndex = Math.max(0, endIndex - windowSize);
+
+  const windowWords = words.slice(startIndex, endIndex).map((word, offset) => ({
+    word,
+    index: startIndex + offset,
+  }));
+
+  const karaokeFontSize = CANVAS_FONT_SIZE + 10;
+  const lineHeightPx = karaokeFontSize * 1.18;
+
+  ctx.font = `900 ${karaokeFontSize}px "Arial Black", "Segoe UI", sans-serif`;
+  ctx.textBaseline = "top";
+  const spaceWidth = ctx.measureText(" ").width;
+
+  const lines = [];
+  let currentLine = [];
+  let currentLineWidth = 0;
+
+  for (const entry of windowWords) {
+    const wordWidth = ctx.measureText(entry.word).width;
+    const leadingSpace = currentLine.length === 0 ? 0 : spaceWidth;
+    const candidateWidth = currentLineWidth + leadingSpace + wordWidth;
+
+    if (currentLine.length > 0 && candidateWidth > maxTextWidth) {
+      lines.push({ words: currentLine, width: currentLineWidth });
+      currentLine = [
+        {
+          ...entry,
+          width: wordWidth,
+          leadingSpace: 0,
+        },
+      ];
+      currentLineWidth = wordWidth;
+      continue;
+    }
+
+    currentLine.push({
+      ...entry,
+      width: wordWidth,
+      leadingSpace,
+    });
+    currentLineWidth = candidateWidth;
+  }
+
+  if (currentLine.length > 0) {
+    lines.push({ words: currentLine, width: currentLineWidth });
+  }
+
+  const totalTextHeight = lines.length * lineHeightPx;
+  const textStartY = (CANVAS_HEIGHT - totalTextHeight) / 2 - 38;
+
+  ctx.textAlign = "center";
+  ctx.font = '700 26px "Segoe UI", "Inter", sans-serif';
+  ctx.fillStyle = "rgba(148, 163, 184, 0.92)";
+  ctx.fillText("KARAOKE TITLES", CANVAS_WIDTH / 2, 54);
+  ctx.textAlign = "left";
+  ctx.font = `900 ${karaokeFontSize}px "Arial Black", "Segoe UI", sans-serif`;
+
+  let lineY = textStartY;
+  for (const line of lines) {
+    let x = (CANVAS_WIDTH - line.width) / 2;
+
+    for (const word of line.words) {
+      x += word.leadingSpace;
+
+      if (word.index < currentWordIndex) {
+        ctx.fillStyle = "rgba(226, 232, 240, 0.58)";
+        ctx.shadowColor = "transparent";
+      } else if (word.index === currentWordIndex) {
+        ctx.fillStyle = "#fde047";
+        ctx.shadowColor = "rgba(251, 191, 36, 0.45)";
+        ctx.shadowBlur = 28;
+      } else {
+        ctx.fillStyle = "#f8fafc";
+        ctx.shadowColor = "transparent";
+      }
+
+      ctx.strokeStyle = "rgba(2, 6, 23, 0.75)";
+      ctx.lineWidth = 7;
+      ctx.strokeText(word.word, x, lineY);
+      ctx.fillText(word.word, x, lineY);
+      x += word.width;
+    }
+
+    lineY += lineHeightPx;
+  }
+
+  ctx.shadowColor = "transparent";
+  ctx.shadowBlur = 0;
 }
 
 function App() {
   const [scriptText, setScriptText] = useState(DEFAULT_SCRIPT);
   const [audioFile, setAudioFile] = useState(null);
+  const [animationStyle, setAnimationStyle] = useState("typewriter");
+  const [exportFormat, setExportFormat] = useState("webm");
+
   const [previewState, setPreviewState] = useState("idle");
   const [previewError, setPreviewError] = useState("");
   const [playheadSeconds, setPlayheadSeconds] = useState(0);
   const [durationSeconds, setDurationSeconds] = useState(0);
+
+  const [exportState, setExportState] = useState("idle");
+  const [exportError, setExportError] = useState("");
+  const [exportDownloadUrl, setExportDownloadUrl] = useState("");
+  const [exportFileName, setExportFileName] = useState("");
 
   const canvasRef = useRef(null);
   const animationFrameRef = useRef(null);
@@ -83,6 +317,17 @@ function App() {
   const audioObjectUrlRef = useRef(null);
   const fallbackStartTimeRef = useRef(0);
   const lastUiSyncRef = useRef(0);
+  const exportDownloadUrlRef = useRef(null);
+
+  const selectedExportMimeType = useMemo(
+    () => pickSupportedMimeType(exportFormat),
+    [exportFormat]
+  );
+
+  const isExporting =
+    exportState === "preparing" ||
+    exportState === "recording" ||
+    exportState === "muxing";
 
   const audioFileLabel = useMemo(() => {
     if (!audioFile) return "No audio selected";
@@ -94,6 +339,16 @@ function App() {
   const previewTimeLabel = `${formatTime(playheadSeconds)} / ${formatTime(
     durationSeconds
   )}`;
+  const exportStateLabel = EXPORT_STATE_LABELS[exportState] ?? "Unknown";
+
+  const clearExportArtifact = useCallback(() => {
+    if (exportDownloadUrlRef.current) {
+      URL.revokeObjectURL(exportDownloadUrlRef.current);
+      exportDownloadUrlRef.current = null;
+    }
+    setExportDownloadUrl("");
+    setExportFileName("");
+  }, []);
 
   const cancelRenderLoop = useCallback(() => {
     if (animationFrameRef.current !== null) {
@@ -121,7 +376,7 @@ function App() {
   }, [cancelRenderLoop, releaseAudioResources]);
 
   const drawFrame = useCallback(
-    (currentTime, duration, isPlaying) => {
+    (currentTime, duration, { isPlaying, showHud }) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
 
@@ -133,54 +388,49 @@ function App() {
         canvas.height = CANVAS_HEIGHT;
       }
 
-      const visibleCharacters = getVisibleCharacterCount(
-        scriptText,
-        currentTime,
-        duration
-      );
-      const visibleText = scriptText.slice(0, visibleCharacters);
-
       const gradient = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
       gradient.addColorStop(0, "#020617");
       gradient.addColorStop(1, "#111827");
       ctx.fillStyle = gradient;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      const timelineBottomSpace = 62;
-      const maxTextWidth = canvas.width - CANVAS_PADDING * 2;
-      const lineHeightPx = CANVAS_FONT_SIZE * CANVAS_LINE_HEIGHT;
-      const maxLines = Math.max(
-        1,
-        Math.floor(
-          (canvas.height - CANVAS_PADDING * 2 - timelineBottomSpace) / lineHeightPx
-        )
+      const vignette = ctx.createRadialGradient(
+        canvas.width / 2,
+        canvas.height / 2,
+        180,
+        canvas.width / 2,
+        canvas.height / 2,
+        canvas.width * 0.7
       );
+      vignette.addColorStop(0, "rgba(15, 23, 42, 0)");
+      vignette.addColorStop(1, "rgba(2, 6, 23, 0.65)");
+      ctx.fillStyle = vignette;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      ctx.fillStyle = "#f8fafc";
-      ctx.font = `700 ${CANVAS_FONT_SIZE}px "Segoe UI", "Inter", sans-serif`;
-      ctx.textBaseline = "top";
+      const timelineBottomSpace = showHud ? 62 : 24;
+      const maxTextWidth = canvas.width - CANVAS_PADDING * 2;
 
-      const wrappedLines = wrapTextToLines(ctx, visibleText, maxTextWidth);
-      const drawableLines = wrappedLines.slice(0, maxLines);
-      let yPosition = CANVAS_PADDING;
-
-      for (const line of drawableLines) {
-        ctx.fillText(line, CANVAS_PADDING, yPosition);
-        yPosition += lineHeightPx;
+      if (animationStyle === "karaoke") {
+        drawKaraokeMode({
+          ctx,
+          scriptText,
+          currentTime,
+          duration,
+          maxTextWidth,
+        });
+      } else {
+        drawTypewriterMode({
+          ctx,
+          scriptText,
+          currentTime,
+          duration,
+          isPlaying,
+          maxTextWidth,
+          timelineBottomSpace,
+        });
       }
 
-      if (isPlaying && visibleCharacters < scriptText.length) {
-        const shouldBlink = Math.floor(currentTime * 2) % 2 === 0;
-        if (shouldBlink) {
-          const currentLine = drawableLines[drawableLines.length - 1] ?? "";
-          const cursorX = CANVAS_PADDING + ctx.measureText(currentLine).width + 6;
-          const cursorY =
-            CANVAS_PADDING + Math.max(drawableLines.length - 1, 0) * lineHeightPx;
-
-          ctx.fillStyle = "#22d3ee";
-          ctx.fillRect(cursorX, cursorY + 8, 6, CANVAS_FONT_SIZE - 12);
-        }
-      }
+      if (!showHud) return;
 
       const progress = duration > 0 ? Math.min(currentTime / duration, 1) : 0;
       const timelineY = canvas.height - 34;
@@ -200,10 +450,12 @@ function App() {
         timelineY - 28
       );
     },
-    [scriptText]
+    [animationStyle, scriptText]
   );
 
   const handlePreview = useCallback(async () => {
+    if (isExporting) return;
+
     setPreviewError("");
 
     if (!scriptText.trim()) {
@@ -220,14 +472,14 @@ function App() {
       const fallbackDuration = Math.min(Math.max(scriptText.length / 14, 3), 24);
       setDurationSeconds(fallbackDuration);
       setPreviewState("playing");
-      drawFrame(0, fallbackDuration, true);
+      drawFrame(0, fallbackDuration, { isPlaying: true, showHud: true });
       fallbackStartTimeRef.current = performance.now();
 
       const stepWithoutAudio = (now) => {
         const elapsedSeconds = (now - fallbackStartTimeRef.current) / 1000;
         const clampedTime = Math.min(elapsedSeconds, fallbackDuration);
 
-        drawFrame(clampedTime, fallbackDuration, true);
+        drawFrame(clampedTime, fallbackDuration, { isPlaying: true, showHud: true });
 
         if (now - lastUiSyncRef.current >= 120 || clampedTime >= fallbackDuration) {
           setPlayheadSeconds(clampedTime);
@@ -236,7 +488,10 @@ function App() {
 
         if (clampedTime >= fallbackDuration) {
           setPreviewState("ended");
-          drawFrame(fallbackDuration, fallbackDuration, false);
+          drawFrame(fallbackDuration, fallbackDuration, {
+            isPlaying: false,
+            showHud: true,
+          });
           animationFrameRef.current = null;
           return;
         }
@@ -256,25 +511,7 @@ function App() {
       const audio = new Audio(objectUrl);
       audio.preload = "auto";
       audioElementRef.current = audio;
-
-      await new Promise((resolve, reject) => {
-        const handleLoadedMetadata = () => {
-          cleanup();
-          resolve();
-        };
-        const handleAudioError = () => {
-          cleanup();
-          reject(new Error("Audio file could not be loaded."));
-        };
-        const cleanup = () => {
-          audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
-          audio.removeEventListener("error", handleAudioError);
-        };
-
-        audio.addEventListener("loadedmetadata", handleLoadedMetadata);
-        audio.addEventListener("error", handleAudioError);
-        audio.load();
-      });
+      await waitForAudioMetadata(audio);
 
       const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
       if (duration <= 0) {
@@ -282,7 +519,7 @@ function App() {
       }
 
       setDurationSeconds(duration);
-      drawFrame(0, duration, false);
+      drawFrame(0, duration, { isPlaying: false, showHud: true });
 
       await audio.play();
       setPreviewState("playing");
@@ -295,7 +532,7 @@ function App() {
         }
 
         const clampedTime = Math.min(activeAudio.currentTime, duration);
-        drawFrame(clampedTime, duration, true);
+        drawFrame(clampedTime, duration, { isPlaying: true, showHud: true });
 
         if (now - lastUiSyncRef.current >= 120 || activeAudio.ended) {
           setPlayheadSeconds(clampedTime);
@@ -305,7 +542,7 @@ function App() {
         if (activeAudio.ended || clampedTime >= duration) {
           setPlayheadSeconds(duration);
           setPreviewState("ended");
-          drawFrame(duration, duration, false);
+          drawFrame(duration, duration, { isPlaying: false, showHud: true });
           stopPreview();
           return;
         }
@@ -321,32 +558,283 @@ function App() {
         error instanceof Error ? error.message : "Preview could not be started."
       );
     }
-  }, [audioFile, drawFrame, scriptText, stopPreview]);
+  }, [audioFile, drawFrame, isExporting, scriptText, stopPreview]);
 
-  const handleExport = () => {
-    setPreviewError("Export Video follows in Step 3 (MediaRecorder API).");
-  };
+  const handleExport = useCallback(async () => {
+    if (isExporting) return;
+
+    setExportError("");
+    setPreviewError("");
+
+    if (!scriptText.trim()) {
+      setExportState("error");
+      setExportError("Please enter text before exporting.");
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      setExportState("error");
+      setExportError("Canvas is not ready yet.");
+      return;
+    }
+
+    if (typeof window.MediaRecorder === "undefined") {
+      setExportState("error");
+      setExportError("MediaRecorder is not available in this browser.");
+      return;
+    }
+
+    if (typeof canvas.captureStream !== "function") {
+      setExportState("error");
+      setExportError("Canvas captureStream() is not supported in this browser.");
+      return;
+    }
+
+    if (!selectedExportMimeType) {
+      setExportState("error");
+      setExportError(
+        `${exportFormat.toUpperCase()} recording is not supported in this browser.`
+      );
+      return;
+    }
+
+    stopPreview();
+    clearExportArtifact();
+    setPlayheadSeconds(0);
+    lastUiSyncRef.current = 0;
+
+    let canvasStream;
+    let composedStream;
+    let recorder;
+    let recorderResultPromise;
+    let exportAudio;
+    let exportAudioUrl;
+    let audioContext;
+    let mediaSourceNode;
+    let mediaDestinationNode;
+    let duration = 0;
+    let fallbackStartTimestamp = 0;
+
+    try {
+      setExportState("preparing");
+
+      if (audioFile) {
+        exportAudioUrl = URL.createObjectURL(audioFile);
+        exportAudio = new Audio(exportAudioUrl);
+        exportAudio.preload = "auto";
+        await waitForAudioMetadata(exportAudio);
+
+        duration = Number.isFinite(exportAudio.duration) ? exportAudio.duration : 0;
+        if (duration <= 0) {
+          throw new Error("Audio duration could not be determined for export.");
+        }
+      } else {
+        duration = Math.min(Math.max(scriptText.length / 14, 3), 24);
+      }
+
+      setDurationSeconds(duration);
+      drawFrame(0, duration, { isPlaying: false, showHud: false });
+
+      canvasStream = canvas.captureStream(60);
+      const videoTrack = canvasStream.getVideoTracks()[0];
+      if (!videoTrack) {
+        throw new Error("Canvas video track could not be created.");
+      }
+
+      composedStream = new MediaStream([videoTrack]);
+
+      if (exportAudio) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass) {
+          throw new Error("AudioContext is not available for audio export.");
+        }
+
+        audioContext = new AudioContextClass();
+        mediaSourceNode = audioContext.createMediaElementSource(exportAudio);
+        mediaDestinationNode = audioContext.createMediaStreamDestination();
+        mediaSourceNode.connect(mediaDestinationNode);
+
+        const audioTrack = mediaDestinationNode.stream.getAudioTracks()[0];
+        if (audioTrack) {
+          composedStream.addTrack(audioTrack);
+        }
+      }
+
+      const chunks = [];
+      recorderResultPromise = new Promise((resolve, reject) => {
+        recorder = new MediaRecorder(composedStream, {
+          mimeType: selectedExportMimeType,
+          videoBitsPerSecond: 8_000_000,
+        });
+
+        recorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            chunks.push(event.data);
+          }
+        };
+
+        recorder.onerror = (event) => {
+          const details =
+            event.error?.message || "MediaRecorder failed during export.";
+          reject(new Error(details));
+        };
+
+        recorder.onstop = () => {
+          resolve(new Blob(chunks, { type: selectedExportMimeType }));
+        };
+      });
+
+      recorder.start(250);
+      setExportState("recording");
+
+      fallbackStartTimestamp = performance.now();
+      if (exportAudio) {
+        await audioContext.resume();
+        await exportAudio.play();
+      }
+
+      await new Promise((resolve) => {
+        const renderStep = (now) => {
+          const playbackTime = exportAudio
+            ? Math.min(exportAudio.currentTime, duration)
+            : Math.min((now - fallbackStartTimestamp) / 1000, duration);
+
+          drawFrame(playbackTime, duration, { isPlaying: true, showHud: false });
+
+          if (now - lastUiSyncRef.current >= 120 || playbackTime >= duration) {
+            setPlayheadSeconds(playbackTime);
+            lastUiSyncRef.current = now;
+          }
+
+          const ended = playbackTime >= duration || (exportAudio?.ended ?? false);
+          if (ended) {
+            setPlayheadSeconds(duration);
+            drawFrame(duration, duration, { isPlaying: false, showHud: false });
+            cancelRenderLoop();
+            resolve();
+            return;
+          }
+
+          animationFrameRef.current = requestAnimationFrame(renderStep);
+        };
+
+        animationFrameRef.current = requestAnimationFrame(renderStep);
+      });
+
+      setExportState("muxing");
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop();
+      }
+
+      const exportBlob = await recorderResultPromise;
+      const extension = selectedExportMimeType.includes("mp4") ? "mp4" : "webm";
+      const sourceName = sanitizeFileBaseName(audioFile?.name || "kinetic-typography");
+      const fileName = `${sourceName}-${animationStyle}.${extension}`;
+      const downloadUrl = URL.createObjectURL(exportBlob);
+
+      exportDownloadUrlRef.current = downloadUrl;
+      setExportDownloadUrl(downloadUrl);
+      setExportFileName(fileName);
+      setExportState("done");
+
+      const autoDownloadLink = document.createElement("a");
+      autoDownloadLink.href = downloadUrl;
+      autoDownloadLink.download = fileName;
+      autoDownloadLink.rel = "noopener";
+      autoDownloadLink.click();
+    } catch (error) {
+      setExportState("error");
+      setExportError(
+        error instanceof Error ? error.message : "Video export failed."
+      );
+    } finally {
+      cancelRenderLoop();
+
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop();
+      }
+
+      if (composedStream) {
+        composedStream.getTracks().forEach((track) => track.stop());
+      }
+
+      if (canvasStream) {
+        canvasStream.getTracks().forEach((track) => track.stop());
+      }
+
+      if (mediaSourceNode) {
+        mediaSourceNode.disconnect();
+      }
+
+      if (mediaDestinationNode) {
+        mediaDestinationNode.disconnect();
+      }
+
+      if (exportAudio) {
+        exportAudio.pause();
+        exportAudio.src = "";
+      }
+
+      if (exportAudioUrl) {
+        URL.revokeObjectURL(exportAudioUrl);
+      }
+
+      if (audioContext) {
+        await audioContext.close();
+      }
+    }
+  }, [
+    animationStyle,
+    audioFile,
+    cancelRenderLoop,
+    clearExportArtifact,
+    drawFrame,
+    exportFormat,
+    isExporting,
+    scriptText,
+    selectedExportMimeType,
+    stopPreview,
+  ]);
 
   useEffect(() => {
-    if (previewState === "playing" || previewState === "loading") return;
+    if (
+      previewState === "playing" ||
+      previewState === "loading" ||
+      isExporting
+    ) {
+      return;
+    }
 
     const referenceDuration = durationSeconds > 0 ? durationSeconds : 5;
     const referenceTime = previewState === "ended" ? referenceDuration : 0;
-    drawFrame(referenceTime, referenceDuration, false);
-  }, [drawFrame, durationSeconds, previewState]);
+    drawFrame(referenceTime, referenceDuration, { isPlaying: false, showHud: true });
+  }, [drawFrame, durationSeconds, isExporting, previewState]);
 
-  useEffect(() => () => stopPreview(), [stopPreview]);
+  useEffect(() => {
+    return () => {
+      stopPreview();
+      clearExportArtifact();
+    };
+  }, [clearExportArtifact, stopPreview]);
 
   const handleAudioSelection = (event) => {
     const file = event.target.files?.[0] ?? null;
 
     stopPreview();
+    clearExportArtifact();
     setAudioFile(file);
     setPreviewState("idle");
+    setExportState("idle");
     setPreviewError("");
+    setExportError("");
     setPlayheadSeconds(0);
     setDurationSeconds(0);
   };
+
+  const exportButtonDisabled =
+    previewState === "loading" || isExporting || !selectedExportMimeType;
+  const previewButtonDisabled = previewState === "loading" || isExporting;
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
@@ -356,7 +844,7 @@ function App() {
             React Kinetic Typography Renderer
           </h1>
           <p className="mt-2 text-sm text-slate-300">
-            Browser-only typewriter animation synced to audio.
+            Browser-only typewriter or karaoke-title animation synced to audio.
           </p>
         </header>
 
@@ -375,6 +863,20 @@ function App() {
 
             <div className="mt-5">
               <label className="mb-2 block text-sm font-semibold text-slate-200">
+                Animation Style
+              </label>
+              <select
+                value={animationStyle}
+                onChange={(event) => setAnimationStyle(event.target.value)}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-400"
+              >
+                <option value="typewriter">Typewriter</option>
+                <option value="karaoke">Karaoke Titles</option>
+              </select>
+            </div>
+
+            <div className="mt-5">
+              <label className="mb-2 block text-sm font-semibold text-slate-200">
                 Audio Upload (MP3/WAV/M4A)
               </label>
               <input
@@ -386,31 +888,65 @@ function App() {
               <p className="mt-2 text-xs text-slate-400">{audioFileLabel}</p>
             </div>
 
+            <div className="mt-5">
+              <label className="mb-2 block text-sm font-semibold text-slate-200">
+                Export Format
+              </label>
+              <select
+                value={exportFormat}
+                onChange={(event) => setExportFormat(event.target.value)}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-400"
+              >
+                <option value="webm">WebM (best browser support)</option>
+                <option value="mp4">MP4 (browser dependent)</option>
+              </select>
+              <p className="mt-2 text-xs text-slate-400">
+                {selectedExportMimeType
+                  ? `Recorder codec: ${selectedExportMimeType}`
+                  : `${exportFormat.toUpperCase()} export not supported in this browser.`}
+              </p>
+            </div>
+
             <div className="mt-6 flex gap-3">
               <button
                 type="button"
                 onClick={handlePreview}
-                disabled={previewState === "loading"}
-                className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
+                disabled={previewButtonDisabled}
+                className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {previewState === "playing" ? "Restart Preview" : "Preview"}
               </button>
               <button
                 type="button"
                 onClick={handleExport}
-                disabled={previewState === "loading"}
-                className="rounded-xl bg-orange-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-orange-400"
+                disabled={exportButtonDisabled}
+                className="rounded-xl bg-orange-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Export Video
+                {isExporting ? "Exporting..." : "Export Video"}
               </button>
             </div>
 
+            {exportDownloadUrl ? (
+              <a
+                href={exportDownloadUrl}
+                download={exportFileName || "kinetic-typography.webm"}
+                className="mt-3 inline-block rounded-lg border border-cyan-400/70 px-3 py-2 text-xs font-semibold text-cyan-300 hover:bg-cyan-500/10"
+              >
+                Download Again: {exportFileName || "video"}
+              </a>
+            ) : null}
+
             <div className="mt-4 rounded-lg border border-slate-700/70 bg-slate-950/70 px-3 py-2 text-xs text-slate-300">
-              <p>Status: {previewStateLabel}</p>
+              <p>Preview: {previewStateLabel}</p>
               <p className="mt-1">Timeline: {previewTimeLabel}</p>
               {previewError ? (
                 <p className="mt-2 text-red-300">{previewError}</p>
               ) : null}
+            </div>
+
+            <div className="mt-3 rounded-lg border border-slate-700/70 bg-slate-950/70 px-3 py-2 text-xs text-slate-300">
+              <p>Export: {exportStateLabel}</p>
+              {exportError ? <p className="mt-2 text-red-300">{exportError}</p> : null}
             </div>
           </div>
 
