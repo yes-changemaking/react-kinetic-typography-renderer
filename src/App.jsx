@@ -8,6 +8,7 @@ const CANVAS_HEIGHT = 720;
 const CANVAS_PADDING = 88;
 const CANVAS_FONT_SIZE = 56;
 const CANVAS_LINE_HEIGHT = 1.32;
+const AUDIO_METADATA_TIMEOUT_MS = 12_000;
 
 const PREVIEW_STATE_LABELS = {
   idle: "Ready",
@@ -57,7 +58,10 @@ function sanitizeFileBaseName(name) {
     .toLowerCase();
 }
 
-function waitForAudioMetadata(audioElement) {
+function waitForAudioMetadata(
+  audioElement,
+  timeoutMs = AUDIO_METADATA_TIMEOUT_MS
+) {
   return new Promise((resolve, reject) => {
     if (audioElement.readyState >= 1 && Number.isFinite(audioElement.duration)) {
       resolve();
@@ -74,7 +78,19 @@ function waitForAudioMetadata(audioElement) {
       reject(new Error("Audio file could not be loaded."));
     };
 
+    const handleTimeout = () => {
+      cleanup();
+      reject(
+        new Error(
+          "Audio metadata loading timed out. Try an MP3/WAV file or click Reset."
+        )
+      );
+    };
+
+    const timeoutId = setTimeout(handleTimeout, timeoutMs);
+
     const cleanup = () => {
+      clearTimeout(timeoutId);
       audioElement.removeEventListener("loadedmetadata", handleLoadedMetadata);
       audioElement.removeEventListener("error", handleAudioError);
     };
@@ -318,6 +334,8 @@ function App() {
   const fallbackStartTimeRef = useRef(0);
   const lastUiSyncRef = useRef(0);
   const exportDownloadUrlRef = useRef(null);
+  const previewSessionRef = useRef(0);
+  const exportSessionRef = useRef(0);
 
   const selectedExportMimeType = useMemo(
     () => pickSupportedMimeType(exportFormat),
@@ -374,6 +392,19 @@ function App() {
     cancelRenderLoop();
     releaseAudioResources();
   }, [cancelRenderLoop, releaseAudioResources]);
+
+  const resetInteractionState = useCallback(() => {
+    previewSessionRef.current += 1;
+    exportSessionRef.current += 1;
+    stopPreview();
+    clearExportArtifact();
+    setPreviewState("idle");
+    setExportState("idle");
+    setPreviewError("");
+    setExportError("");
+    setPlayheadSeconds(0);
+    setDurationSeconds(0);
+  }, [clearExportArtifact, stopPreview]);
 
   const drawFrame = useCallback(
     (currentTime, duration, { isPlaying, showHud }) => {
@@ -456,6 +487,9 @@ function App() {
   const handlePreview = useCallback(async () => {
     if (isExporting) return;
 
+    const previewSessionId = previewSessionRef.current + 1;
+    previewSessionRef.current = previewSessionId;
+
     setPreviewError("");
 
     if (!scriptText.trim()) {
@@ -476,6 +510,11 @@ function App() {
       fallbackStartTimeRef.current = performance.now();
 
       const stepWithoutAudio = (now) => {
+        if (previewSessionId !== previewSessionRef.current) {
+          animationFrameRef.current = null;
+          return;
+        }
+
         const elapsedSeconds = (now - fallbackStartTimeRef.current) / 1000;
         const clampedTime = Math.min(elapsedSeconds, fallbackDuration);
 
@@ -511,7 +550,11 @@ function App() {
       const audio = new Audio(objectUrl);
       audio.preload = "auto";
       audioElementRef.current = audio;
-      await waitForAudioMetadata(audio);
+      await waitForAudioMetadata(audio, AUDIO_METADATA_TIMEOUT_MS);
+
+      if (previewSessionId !== previewSessionRef.current) {
+        return;
+      }
 
       const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
       if (duration <= 0) {
@@ -522,9 +565,19 @@ function App() {
       drawFrame(0, duration, { isPlaying: false, showHud: true });
 
       await audio.play();
+
+      if (previewSessionId !== previewSessionRef.current) {
+        return;
+      }
+
       setPreviewState("playing");
 
       const stepWithAudio = (now) => {
+        if (previewSessionId !== previewSessionRef.current) {
+          animationFrameRef.current = null;
+          return;
+        }
+
         const activeAudio = audioElementRef.current;
         if (!activeAudio) {
           animationFrameRef.current = null;
@@ -552,6 +605,9 @@ function App() {
 
       animationFrameRef.current = requestAnimationFrame(stepWithAudio);
     } catch (error) {
+      if (previewSessionId !== previewSessionRef.current) {
+        return;
+      }
       stopPreview();
       setPreviewState("error");
       setPreviewError(
@@ -562,6 +618,10 @@ function App() {
 
   const handleExport = useCallback(async () => {
     if (isExporting) return;
+
+    const exportSessionId = exportSessionRef.current + 1;
+    exportSessionRef.current = exportSessionId;
+    previewSessionRef.current += 1;
 
     setExportError("");
     setPreviewError("");
@@ -623,7 +683,11 @@ function App() {
         exportAudioUrl = URL.createObjectURL(audioFile);
         exportAudio = new Audio(exportAudioUrl);
         exportAudio.preload = "auto";
-        await waitForAudioMetadata(exportAudio);
+        await waitForAudioMetadata(exportAudio, AUDIO_METADATA_TIMEOUT_MS);
+
+        if (exportSessionId !== exportSessionRef.current) {
+          return;
+        }
 
         duration = Number.isFinite(exportAudio.duration) ? exportAudio.duration : 0;
         if (duration <= 0) {
@@ -694,8 +758,18 @@ function App() {
         await exportAudio.play();
       }
 
+      if (exportSessionId !== exportSessionRef.current) {
+        return;
+      }
+
       await new Promise((resolve) => {
         const renderStep = (now) => {
+          if (exportSessionId !== exportSessionRef.current) {
+            cancelRenderLoop();
+            resolve();
+            return;
+          }
+
           const playbackTime = exportAudio
             ? Math.min(exportAudio.currentTime, duration)
             : Math.min((now - fallbackStartTimestamp) / 1000, duration);
@@ -728,6 +802,9 @@ function App() {
       }
 
       const exportBlob = await recorderResultPromise;
+      if (exportSessionId !== exportSessionRef.current) {
+        return;
+      }
       const extension = selectedExportMimeType.includes("mp4") ? "mp4" : "webm";
       const sourceName = sanitizeFileBaseName(audioFile?.name || "kinetic-typography");
       const fileName = `${sourceName}-${animationStyle}.${extension}`;
@@ -744,6 +821,9 @@ function App() {
       autoDownloadLink.rel = "noopener";
       autoDownloadLink.click();
     } catch (error) {
+      if (exportSessionId !== exportSessionRef.current) {
+        return;
+      }
       setExportState("error");
       setExportError(
         error instanceof Error ? error.message : "Video export failed."
@@ -813,28 +893,26 @@ function App() {
 
   useEffect(() => {
     return () => {
+      previewSessionRef.current += 1;
+      exportSessionRef.current += 1;
       stopPreview();
       clearExportArtifact();
     };
   }, [clearExportArtifact, stopPreview]);
 
+  const handleReset = useCallback(() => {
+    resetInteractionState();
+  }, [resetInteractionState]);
+
   const handleAudioSelection = (event) => {
     const file = event.target.files?.[0] ?? null;
 
-    stopPreview();
-    clearExportArtifact();
+    resetInteractionState();
     setAudioFile(file);
-    setPreviewState("idle");
-    setExportState("idle");
-    setPreviewError("");
-    setExportError("");
-    setPlayheadSeconds(0);
-    setDurationSeconds(0);
   };
 
-  const exportButtonDisabled =
-    previewState === "loading" || isExporting || !selectedExportMimeType;
-  const previewButtonDisabled = previewState === "loading" || isExporting;
+  const exportButtonDisabled = isExporting || !selectedExportMimeType;
+  const previewButtonDisabled = isExporting;
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
@@ -924,6 +1002,13 @@ function App() {
               >
                 {isExporting ? "Exporting..." : "Export Video"}
               </button>
+              <button
+                type="button"
+                onClick={handleReset}
+                className="rounded-xl border border-slate-600 px-4 py-2 text-sm font-semibold text-slate-200 hover:border-slate-400 hover:text-white"
+              >
+                Reset
+              </button>
             </div>
 
             {exportDownloadUrl ? (
@@ -947,6 +1032,9 @@ function App() {
             <div className="mt-3 rounded-lg border border-slate-700/70 bg-slate-950/70 px-3 py-2 text-xs text-slate-300">
               <p>Export: {exportStateLabel}</p>
               {exportError ? <p className="mt-2 text-red-300">{exportError}</p> : null}
+              <p className="mt-2 text-slate-500">
+                If controls seem stuck, click Reset.
+              </p>
             </div>
           </div>
 
