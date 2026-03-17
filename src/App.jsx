@@ -9,6 +9,9 @@ const CANVAS_PADDING = 88;
 const CANVAS_FONT_SIZE = 56;
 const CANVAS_LINE_HEIGHT = 1.32;
 const AUDIO_METADATA_TIMEOUT_MS = 12_000;
+const MIN_CUE_DURATION_SEC = 0.2;
+const MIN_PAGE_DURATION_SEC = 0.14;
+const TYPEWRITER_FONT = `700 ${CANVAS_FONT_SIZE}px "Segoe UI", "Inter", sans-serif`;
 
 const PREVIEW_STATE_LABELS = {
   idle: "Ready",
@@ -25,6 +28,14 @@ const EXPORT_STATE_LABELS = {
   muxing: "Finalizing video blob...",
   done: "Export complete",
   error: "Export error",
+};
+
+const EMPTY_TYPEWRITER_STATUS = {
+  cueNumber: 0,
+  cueTotal: 0,
+  pageNumber: 0,
+  pageTotal: 0,
+  inLyricsRange: false,
 };
 
 const EXPORT_MIME_CANDIDATES = {
@@ -47,6 +58,10 @@ function formatTime(seconds) {
 
 function clamp01(value) {
   return Math.min(Math.max(value, 0), 1);
+}
+
+function clampRange(value, min, max) {
+  return Math.min(Math.max(value, min), max);
 }
 
 function sanitizeFileBaseName(name) {
@@ -136,10 +151,289 @@ function wrapTextToLines(ctx, text, maxWidth) {
   return lines;
 }
 
-function getVisibleCharacterCount(text, currentTime, duration) {
-  if (!text) return 0;
-  if (!Number.isFinite(duration) || duration <= 0) return text.length;
-  return Math.floor(clamp01(currentTime / duration) * text.length);
+function countNonWhitespaceChars(text) {
+  return (text || "").replace(/\s+/g, "").length;
+}
+
+function chunkLines(lines, maxVisibleLines) {
+  const chunks = [];
+
+  for (let index = 0; index < lines.length; index += maxVisibleLines) {
+    chunks.push(lines.slice(index, index + maxVisibleLines));
+  }
+
+  return chunks;
+}
+
+function allocateWeightedDurations(weights, totalDuration, minDurationPerItem) {
+  const count = weights.length;
+  if (!count) return [];
+
+  const safeDuration = Number.isFinite(totalDuration) ? Math.max(totalDuration, 0) : 0;
+  if (safeDuration <= 0) {
+    return Array(count).fill(0);
+  }
+
+  const safeWeights = weights.map((weight) => Math.max(weight, 1));
+  const minTotal = minDurationPerItem * count;
+  let durations;
+
+  if (safeDuration <= minTotal) {
+    durations = Array(count).fill(safeDuration / count);
+  } else {
+    const extra = safeDuration - minTotal;
+    const weightTotal = safeWeights.reduce((sum, weight) => sum + weight, 0);
+    durations = safeWeights.map(
+      (weight) => minDurationPerItem + (weight / weightTotal) * extra
+    );
+  }
+
+  const cumulative = durations.reduce((sum, duration) => sum + duration, 0);
+  const correction = safeDuration - cumulative;
+  durations[durations.length - 1] += correction;
+
+  return durations;
+}
+
+function buildTypewriterTimeline({
+  scriptText,
+  audioDuration,
+  lyricsStartOffsetSec,
+  maxVisibleLines,
+  maxTextWidth,
+  measurementCtx,
+}) {
+  if (!scriptText.trim()) {
+    return {
+      cues: [],
+      pages: [],
+      lyricsDurationSec: 0,
+      lyricsStartOffsetSec,
+      lyricsEndSec: lyricsStartOffsetSec,
+    };
+  }
+
+  const normalizedText = scriptText.replace(/\r\n/g, "\n").trim();
+  const stanzas = normalizedText
+    .split(/\n\s*\n+/)
+    .map((stanza) => stanza.trim())
+    .filter(Boolean);
+
+  const cueTexts = stanzas.length ? stanzas : [normalizedText];
+  const cueWeights = cueTexts.map((text) => Math.max(countNonWhitespaceChars(text), 1));
+
+  const lyricsDurationSec = Math.max(
+    0.1,
+    audioDuration - Math.max(0, lyricsStartOffsetSec)
+  );
+  const cueDurations = allocateWeightedDurations(
+    cueWeights,
+    lyricsDurationSec,
+    MIN_CUE_DURATION_SEC
+  );
+
+  const cues = [];
+  const pages = [];
+  let cueStartRel = 0;
+
+  cueTexts.forEach((cueText, cueIndex) => {
+    const cueDuration = cueDurations[cueIndex];
+    const cueEndRel = cueStartRel + cueDuration;
+    const cueLines = wrapTextToLines(measurementCtx, cueText, maxTextWidth);
+    const lineGroups = chunkLines(cueLines.length ? cueLines : [""], maxVisibleLines);
+    const pageWeights = lineGroups.map((lines) =>
+      Math.max(countNonWhitespaceChars(lines.join("")), 1)
+    );
+    const pageDurations = allocateWeightedDurations(
+      pageWeights,
+      cueDuration,
+      MIN_PAGE_DURATION_SEC
+    );
+
+    let pageStartRel = cueStartRel;
+    const cuePages = lineGroups.map((lines, pageIndexInCue) => {
+      const pageDuration = pageDurations[pageIndexInCue];
+      const pageEndRel = pageStartRel + pageDuration;
+      const lineCharCounts = lines.map((line) => line.length);
+      const totalChars = Math.max(
+        1,
+        lineCharCounts.reduce((sum, lineCharCount) => sum + lineCharCount, 0)
+      );
+
+      const pageModel = {
+        lines,
+        text: lines.join("\n"),
+        charWeight: pageWeights[pageIndexInCue],
+        startRel: pageStartRel,
+        endRel: pageEndRel,
+        startSec: lyricsStartOffsetSec + pageStartRel,
+        endSec: lyricsStartOffsetSec + pageEndRel,
+        cueIndex,
+        pageIndexInCue,
+        lineCharCounts,
+        totalChars,
+      };
+
+      pageStartRel = pageEndRel;
+      return pageModel;
+    });
+
+    cuePages.forEach((pageModel) => pages.push(pageModel));
+    cues.push({
+      text: cueText,
+      startRel: cueStartRel,
+      endRel: cueEndRel,
+      startSec: lyricsStartOffsetSec + cueStartRel,
+      endSec: lyricsStartOffsetSec + cueEndRel,
+      charWeight: cueWeights[cueIndex],
+      pages: cuePages,
+    });
+
+    cueStartRel = cueEndRel;
+  });
+
+  if (pages.length) {
+    const lastPage = pages[pages.length - 1];
+    lastPage.endRel = lyricsDurationSec;
+    lastPage.endSec = lyricsStartOffsetSec + lyricsDurationSec;
+  }
+
+  if (cues.length) {
+    const lastCue = cues[cues.length - 1];
+    lastCue.endRel = lyricsDurationSec;
+    lastCue.endSec = lyricsStartOffsetSec + lyricsDurationSec;
+  }
+
+  return {
+    cues,
+    pages,
+    lyricsDurationSec,
+    lyricsStartOffsetSec,
+    lyricsEndSec: lyricsStartOffsetSec + lyricsDurationSec,
+  };
+}
+
+function resolvePageRenderState(timelineModel, currentAudioTime) {
+  if (!timelineModel.pages.length) {
+    return {
+      activePage: null,
+      pageProgress: 0,
+      inLyricsRange: false,
+      cueNumber: 0,
+      cueTotal: 0,
+      pageNumber: 0,
+      pageTotal: 0,
+    };
+  }
+
+  const lyricsTimeRel = currentAudioTime - timelineModel.lyricsStartOffsetSec;
+  const cueTotal = timelineModel.cues.length;
+
+  if (lyricsTimeRel < 0) {
+    return {
+      activePage: null,
+      pageProgress: 0,
+      inLyricsRange: false,
+      cueNumber: 0,
+      cueTotal,
+      pageNumber: 0,
+      pageTotal: 0,
+    };
+  }
+
+  const clampedRelTime = Math.min(
+    Math.max(lyricsTimeRel, 0),
+    timelineModel.lyricsDurationSec
+  );
+
+  let activePage = timelineModel.pages[timelineModel.pages.length - 1];
+  for (const candidatePage of timelineModel.pages) {
+    if (clampedRelTime < candidatePage.endRel) {
+      activePage = candidatePage;
+      break;
+    }
+  }
+
+  const activeCue = timelineModel.cues[activePage.cueIndex];
+  const cueDuration = Math.max(activeCue.endRel - activeCue.startRel, 0.0001);
+  const pageDuration = Math.max(activePage.endRel - activePage.startRel, 0.0001);
+  const pageProgress =
+    clampedRelTime >= timelineModel.lyricsDurationSec
+      ? 1
+      : clamp01((clampedRelTime - activePage.startRel) / pageDuration);
+
+  return {
+    activePage,
+    pageProgress,
+    inLyricsRange: true,
+    cueNumber: activePage.cueIndex + 1,
+    cueTotal,
+    pageNumber: activePage.pageIndexInCue + 1,
+    pageTotal: activeCue.pages.length,
+    cueProgress: clamp01((clampedRelTime - activeCue.startRel) / cueDuration),
+  };
+}
+
+function drawTypewriterMode({
+  ctx,
+  timelineModel,
+  currentTime,
+  isPlaying,
+  maxTextWidth,
+}) {
+  ctx.fillStyle = "#f8fafc";
+  ctx.font = TYPEWRITER_FONT;
+  ctx.textBaseline = "top";
+
+  const renderState = resolvePageRenderState(timelineModel, currentTime);
+  if (!renderState.activePage || !renderState.inLyricsRange) {
+    return renderState;
+  }
+
+  const activePage = renderState.activePage;
+  const visibleChars = Math.floor(renderState.pageProgress * activePage.totalChars);
+  const lineHeightPx = CANVAS_FONT_SIZE * CANVAS_LINE_HEIGHT;
+
+  let remainingChars = visibleChars;
+  const visibleLines = activePage.lines.map((line) => {
+    const charsForLine = Math.min(Math.max(remainingChars, 0), line.length);
+    remainingChars -= line.length;
+    return line.slice(0, charsForLine);
+  });
+
+  let yPosition = CANVAS_PADDING;
+  for (const visibleLine of visibleLines) {
+    ctx.fillText(visibleLine, CANVAS_PADDING, yPosition);
+    yPosition += lineHeightPx;
+  }
+
+  if (isPlaying && renderState.pageProgress < 1) {
+    let cursorLineIndex = 0;
+    let charsBeforeCursor = visibleChars;
+
+    for (let index = 0; index < activePage.lines.length; index += 1) {
+      const lineLength = activePage.lines[index].length;
+      if (charsBeforeCursor <= lineLength) {
+        cursorLineIndex = index;
+        break;
+      }
+
+      charsBeforeCursor -= lineLength;
+      cursorLineIndex = Math.min(index + 1, activePage.lines.length - 1);
+    }
+
+    const cursorPrefix = activePage.lines[cursorLineIndex].slice(0, charsBeforeCursor);
+    const cursorX = CANVAS_PADDING + Math.min(ctx.measureText(cursorPrefix).width + 6, maxTextWidth);
+    const cursorY = CANVAS_PADDING + cursorLineIndex * lineHeightPx;
+
+    const shouldBlink = Math.floor(currentTime * 2) % 2 === 0;
+    if (shouldBlink) {
+      ctx.fillStyle = "#22d3ee";
+      ctx.fillRect(cursorX, cursorY + 8, 6, CANVAS_FONT_SIZE - 12);
+    }
+  }
+
+  return renderState;
 }
 
 function pickSupportedMimeType(format) {
@@ -154,52 +448,6 @@ function pickSupportedMimeType(format) {
   }
 
   return candidates.find((mimeType) => isTypeSupported(mimeType)) ?? null;
-}
-
-function drawTypewriterMode({
-  ctx,
-  scriptText,
-  currentTime,
-  duration,
-  isPlaying,
-  maxTextWidth,
-  timelineBottomSpace,
-}) {
-  const visibleCharacters = getVisibleCharacterCount(scriptText, currentTime, duration);
-  const visibleText = scriptText.slice(0, visibleCharacters);
-  const lineHeightPx = CANVAS_FONT_SIZE * CANVAS_LINE_HEIGHT;
-  const maxLines = Math.max(
-    1,
-    Math.floor(
-      (CANVAS_HEIGHT - CANVAS_PADDING * 2 - timelineBottomSpace) / lineHeightPx
-    )
-  );
-
-  ctx.fillStyle = "#f8fafc";
-  ctx.font = `700 ${CANVAS_FONT_SIZE}px "Segoe UI", "Inter", sans-serif`;
-  ctx.textBaseline = "top";
-
-  const wrappedLines = wrapTextToLines(ctx, visibleText, maxTextWidth);
-  const drawableLines = wrappedLines.slice(0, maxLines);
-  let yPosition = CANVAS_PADDING;
-
-  for (const line of drawableLines) {
-    ctx.fillText(line, CANVAS_PADDING, yPosition);
-    yPosition += lineHeightPx;
-  }
-
-  if (isPlaying && visibleCharacters < scriptText.length) {
-    const shouldBlink = Math.floor(currentTime * 2) % 2 === 0;
-    if (shouldBlink) {
-      const currentLine = drawableLines[drawableLines.length - 1] ?? "";
-      const cursorX = CANVAS_PADDING + ctx.measureText(currentLine).width + 6;
-      const cursorY =
-        CANVAS_PADDING + Math.max(drawableLines.length - 1, 0) * lineHeightPx;
-
-      ctx.fillStyle = "#22d3ee";
-      ctx.fillRect(cursorX, cursorY + 8, 6, CANVAS_FONT_SIZE - 12);
-    }
-  }
 }
 
 function drawKaraokeMode({ ctx, scriptText, currentTime, duration, maxTextWidth }) {
@@ -316,11 +564,16 @@ function App() {
   const [audioFile, setAudioFile] = useState(null);
   const [animationStyle, setAnimationStyle] = useState("typewriter");
   const [exportFormat, setExportFormat] = useState("webm");
+  const [maxVisibleLines, setMaxVisibleLines] = useState(4);
+  const [lyricsStartOffsetSec, setLyricsStartOffsetSec] = useState(0);
 
   const [previewState, setPreviewState] = useState("idle");
   const [previewError, setPreviewError] = useState("");
   const [playheadSeconds, setPlayheadSeconds] = useState(0);
   const [durationSeconds, setDurationSeconds] = useState(0);
+  const [typewriterStatus, setTypewriterStatus] = useState(
+    EMPTY_TYPEWRITER_STATUS
+  );
 
   const [exportState, setExportState] = useState("idle");
   const [exportError, setExportError] = useState("");
@@ -336,6 +589,8 @@ function App() {
   const exportDownloadUrlRef = useRef(null);
   const previewSessionRef = useRef(0);
   const exportSessionRef = useRef(0);
+  const measureCanvasRef = useRef(null);
+  const typewriterTimelineCacheRef = useRef(null);
 
   const selectedExportMimeType = useMemo(
     () => pickSupportedMimeType(exportFormat),
@@ -360,6 +615,23 @@ function App() {
   const previewProgressPercent =
     durationSeconds > 0 ? clamp01(playheadSeconds / durationSeconds) * 100 : 0;
   const exportStateLabel = EXPORT_STATE_LABELS[exportState] ?? "Unknown";
+  const cueLabel =
+    animationStyle !== "typewriter"
+      ? "n/a (karaoke)"
+      : typewriterStatus.cueTotal > 0
+      ? `${typewriterStatus.cueNumber}/${typewriterStatus.cueTotal}`
+      : "0/0";
+  const pageLabel =
+    animationStyle !== "typewriter"
+      ? "n/a (karaoke)"
+      : typewriterStatus.pageTotal > 0
+      ? `${typewriterStatus.pageNumber}/${typewriterStatus.pageTotal}`
+      : "0/0";
+  const waitingForOffset =
+    animationStyle === "typewriter" &&
+    previewState === "playing" &&
+    !typewriterStatus.inLyricsRange &&
+    playheadSeconds < lyricsStartOffsetSec;
 
   const clearExportArtifact = useCallback(() => {
     if (exportDownloadUrlRef.current) {
@@ -406,15 +678,77 @@ function App() {
     setExportError("");
     setPlayheadSeconds(0);
     setDurationSeconds(0);
+    setTypewriterStatus(EMPTY_TYPEWRITER_STATUS);
   }, [clearExportArtifact, stopPreview]);
+
+  const getMeasurementContext = useCallback(() => {
+    if (!measureCanvasRef.current) {
+      measureCanvasRef.current = document.createElement("canvas");
+    }
+
+    const measurementCtx = measureCanvasRef.current.getContext("2d");
+    if (!measurementCtx) return null;
+
+    measurementCtx.font = TYPEWRITER_FONT;
+    measurementCtx.textBaseline = "top";
+    return measurementCtx;
+  }, []);
+
+  const getTypewriterTimeline = useCallback(
+    (duration, maxTextWidth) => {
+      const safeDuration = Number.isFinite(duration) ? Math.max(duration, 0.1) : 0.1;
+      const cache = typewriterTimelineCacheRef.current;
+      const cacheHit =
+        cache &&
+        cache.scriptText === scriptText &&
+        cache.duration === safeDuration &&
+        cache.maxVisibleLines === maxVisibleLines &&
+        cache.lyricsStartOffsetSec === lyricsStartOffsetSec &&
+        cache.maxTextWidth === maxTextWidth;
+
+      if (cacheHit) return cache.model;
+
+      const measurementCtx = getMeasurementContext();
+      if (!measurementCtx) {
+        return {
+          cues: [],
+          pages: [],
+          lyricsDurationSec: 0,
+          lyricsStartOffsetSec,
+          lyricsEndSec: lyricsStartOffsetSec,
+        };
+      }
+
+      const timelineModel = buildTypewriterTimeline({
+        scriptText,
+        audioDuration: safeDuration,
+        lyricsStartOffsetSec,
+        maxVisibleLines,
+        maxTextWidth,
+        measurementCtx,
+      });
+
+      typewriterTimelineCacheRef.current = {
+        scriptText,
+        duration: safeDuration,
+        maxVisibleLines,
+        lyricsStartOffsetSec,
+        maxTextWidth,
+        model: timelineModel,
+      };
+
+      return timelineModel;
+    },
+    [getMeasurementContext, lyricsStartOffsetSec, maxVisibleLines, scriptText]
+  );
 
   const drawFrame = useCallback(
     (currentTime, duration, { isPlaying, showHud }) => {
       const canvas = canvasRef.current;
-      if (!canvas) return;
+      if (!canvas) return { typewriterStatus: EMPTY_TYPEWRITER_STATUS };
 
       const ctx = canvas.getContext("2d");
-      if (!ctx) return;
+      if (!ctx) return { typewriterStatus: EMPTY_TYPEWRITER_STATUS };
 
       if (canvas.width !== CANVAS_WIDTH || canvas.height !== CANVAS_HEIGHT) {
         canvas.width = CANVAS_WIDTH;
@@ -440,8 +774,8 @@ function App() {
       ctx.fillStyle = vignette;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      const timelineBottomSpace = showHud ? 62 : 24;
       const maxTextWidth = canvas.width - CANVAS_PADDING * 2;
+      let nextTypewriterStatus = EMPTY_TYPEWRITER_STATUS;
 
       if (animationStyle === "karaoke") {
         drawKaraokeMode({
@@ -452,18 +786,27 @@ function App() {
           maxTextWidth,
         });
       } else {
-        drawTypewriterMode({
+        const timelineModel = getTypewriterTimeline(duration, maxTextWidth);
+        const renderState = drawTypewriterMode({
           ctx,
-          scriptText,
+          timelineModel,
           currentTime,
-          duration,
           isPlaying,
           maxTextWidth,
-          timelineBottomSpace,
         });
+
+        nextTypewriterStatus = {
+          cueNumber: renderState.cueNumber ?? 0,
+          cueTotal: renderState.cueTotal ?? 0,
+          pageNumber: renderState.pageNumber ?? 0,
+          pageTotal: renderState.pageTotal ?? 0,
+          inLyricsRange: renderState.inLyricsRange ?? false,
+        };
       }
 
-      if (!showHud) return;
+      if (!showHud) {
+        return { typewriterStatus: nextTypewriterStatus };
+      }
 
       const progress = duration > 0 ? Math.min(currentTime / duration, 1) : 0;
       const timelineY = canvas.height - 34;
@@ -482,14 +825,17 @@ function App() {
         CANVAS_PADDING,
         timelineY - 28
       );
+
+      return { typewriterStatus: nextTypewriterStatus };
     },
-    [animationStyle, scriptText]
+    [animationStyle, getTypewriterTimeline, scriptText]
   );
 
   const runSilentPreviewLoop = useCallback(
     (duration, previewSessionId) => {
       setPreviewState("playing");
-      drawFrame(0, duration, { isPlaying: true, showHud: true });
+      const initialRender = drawFrame(0, duration, { isPlaying: true, showHud: true });
+      setTypewriterStatus(initialRender.typewriterStatus);
       fallbackStartTimeRef.current = performance.now();
 
       const stepWithoutAudio = (now) => {
@@ -501,16 +847,24 @@ function App() {
         const elapsedSeconds = (now - fallbackStartTimeRef.current) / 1000;
         const clampedTime = Math.min(elapsedSeconds, duration);
 
-        drawFrame(clampedTime, duration, { isPlaying: true, showHud: true });
+        const renderMeta = drawFrame(clampedTime, duration, {
+          isPlaying: true,
+          showHud: true,
+        });
 
         if (now - lastUiSyncRef.current >= 120 || clampedTime >= duration) {
           setPlayheadSeconds(clampedTime);
+          setTypewriterStatus(renderMeta.typewriterStatus);
           lastUiSyncRef.current = now;
         }
 
         if (clampedTime >= duration) {
           setPreviewState("ended");
-          drawFrame(duration, duration, { isPlaying: false, showHud: true });
+          const finalRender = drawFrame(duration, duration, {
+            isPlaying: false,
+            showHud: true,
+          });
+          setTypewriterStatus(finalRender.typewriterStatus);
           animationFrameRef.current = null;
           return;
         }
@@ -540,6 +894,7 @@ function App() {
     stopPreview();
     lastUiSyncRef.current = 0;
     setPlayheadSeconds(0);
+    setTypewriterStatus(EMPTY_TYPEWRITER_STATUS);
 
     if (!audioFile) {
       const fallbackDuration = Math.min(Math.max(scriptText.length / 14, 3), 24);
@@ -568,7 +923,11 @@ function App() {
       }
 
       setDurationSeconds(duration);
-      drawFrame(0, duration, { isPlaying: false, showHud: true });
+      const firstFrameMeta = drawFrame(0, duration, {
+        isPlaying: false,
+        showHud: true,
+      });
+      setTypewriterStatus(firstFrameMeta.typewriterStatus);
 
       let playbackStarted = false;
       try {
@@ -606,17 +965,25 @@ function App() {
         }
 
         const clampedTime = Math.min(activeAudio.currentTime, duration);
-        drawFrame(clampedTime, duration, { isPlaying: true, showHud: true });
+        const renderMeta = drawFrame(clampedTime, duration, {
+          isPlaying: true,
+          showHud: true,
+        });
 
         if (now - lastUiSyncRef.current >= 120 || activeAudio.ended) {
           setPlayheadSeconds(clampedTime);
+          setTypewriterStatus(renderMeta.typewriterStatus);
           lastUiSyncRef.current = now;
         }
 
         if (activeAudio.ended || clampedTime >= duration) {
           setPlayheadSeconds(duration);
           setPreviewState("ended");
-          drawFrame(duration, duration, { isPlaying: false, showHud: true });
+          const finalRender = drawFrame(duration, duration, {
+            isPlaying: false,
+            showHud: true,
+          });
+          setTypewriterStatus(finalRender.typewriterStatus);
           stopPreview();
           return;
         }
@@ -634,6 +1001,7 @@ function App() {
       setPreviewError(
         error instanceof Error ? error.message : "Preview could not be started."
       );
+      setTypewriterStatus(EMPTY_TYPEWRITER_STATUS);
     }
   }, [
     audioFile,
@@ -690,6 +1058,7 @@ function App() {
     stopPreview();
     clearExportArtifact();
     setPlayheadSeconds(0);
+    setTypewriterStatus(EMPTY_TYPEWRITER_STATUS);
     lastUiSyncRef.current = 0;
 
     let canvasStream;
@@ -726,7 +1095,11 @@ function App() {
       }
 
       setDurationSeconds(duration);
-      drawFrame(0, duration, { isPlaying: false, showHud: false });
+      const initialExportFrame = drawFrame(0, duration, {
+        isPlaying: false,
+        showHud: false,
+      });
+      setTypewriterStatus(initialExportFrame.typewriterStatus);
 
       canvasStream = canvas.captureStream(60);
       const videoTrack = canvasStream.getVideoTracks()[0];
@@ -802,17 +1175,25 @@ function App() {
             ? Math.min(exportAudio.currentTime, duration)
             : Math.min((now - fallbackStartTimestamp) / 1000, duration);
 
-          drawFrame(playbackTime, duration, { isPlaying: true, showHud: false });
+          const renderMeta = drawFrame(playbackTime, duration, {
+            isPlaying: true,
+            showHud: false,
+          });
 
           if (now - lastUiSyncRef.current >= 120 || playbackTime >= duration) {
             setPlayheadSeconds(playbackTime);
+            setTypewriterStatus(renderMeta.typewriterStatus);
             lastUiSyncRef.current = now;
           }
 
           const ended = playbackTime >= duration || (exportAudio?.ended ?? false);
           if (ended) {
             setPlayheadSeconds(duration);
-            drawFrame(duration, duration, { isPlaying: false, showHud: false });
+            const finalExportFrame = drawFrame(duration, duration, {
+              isPlaying: false,
+              showHud: false,
+            });
+            setTypewriterStatus(finalExportFrame.typewriterStatus);
             cancelRenderLoop();
             resolve();
             return;
@@ -916,7 +1297,11 @@ function App() {
 
     const referenceDuration = durationSeconds > 0 ? durationSeconds : 5;
     const referenceTime = previewState === "ended" ? referenceDuration : 0;
-    drawFrame(referenceTime, referenceDuration, { isPlaying: false, showHud: true });
+    const renderMeta = drawFrame(referenceTime, referenceDuration, {
+      isPlaying: false,
+      showHud: true,
+    });
+    setTypewriterStatus(renderMeta.typewriterStatus);
   }, [drawFrame, durationSeconds, isExporting, previewState]);
 
   useEffect(() => {
@@ -939,8 +1324,21 @@ function App() {
     setAudioFile(file);
   };
 
-  const exportButtonDisabled = isExporting || !selectedExportMimeType;
-  const previewButtonDisabled = isExporting;
+  const handleMaxVisibleLinesChange = (event) => {
+    const value = clampRange(Number(event.target.value), 1, 5);
+    setMaxVisibleLines(value);
+  };
+
+  const handleLyricsOffsetChange = (event) => {
+    const nextOffset = clampRange(Number(event.target.value), -5, 15);
+    setLyricsStartOffsetSec(nextOffset);
+  };
+
+  const settingsLocked =
+    previewState === "playing" || previewState === "loading" || isExporting;
+  const exportButtonDisabled =
+    isExporting || previewState === "loading" || !selectedExportMimeType;
+  const previewButtonDisabled = isExporting || previewState === "loading";
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
@@ -979,6 +1377,45 @@ function App() {
                 <option value="typewriter">Typewriter</option>
                 <option value="karaoke">Karaoke Titles</option>
               </select>
+            </div>
+
+            <div className="mt-5">
+              <label className="mb-2 block text-sm font-semibold text-slate-200">
+                Max Visible Lines (Typewriter)
+              </label>
+              <select
+                value={maxVisibleLines}
+                onChange={handleMaxVisibleLinesChange}
+                disabled={animationStyle !== "typewriter" || settingsLocked}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-400 disabled:opacity-60"
+              >
+                <option value={1}>1 line</option>
+                <option value={2}>2 lines</option>
+                <option value={3}>3 lines</option>
+                <option value={4}>4 lines</option>
+                <option value={5}>5 lines</option>
+              </select>
+            </div>
+
+            <div className="mt-5">
+              <label className="mb-2 block text-sm font-semibold text-slate-200">
+                Lyrics Start Offset (sec)
+              </label>
+              <input
+                type="range"
+                min="-5"
+                max="15"
+                step="0.1"
+                value={lyricsStartOffsetSec}
+                onChange={handleLyricsOffsetChange}
+                disabled={animationStyle !== "typewriter" || settingsLocked}
+                className="w-full accent-cyan-400 disabled:opacity-60"
+              />
+              <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
+                <span>-5.0s</span>
+                <span>{lyricsStartOffsetSec.toFixed(1)}s</span>
+                <span>+15.0s</span>
+              </div>
             </div>
 
             <div className="mt-5">
@@ -1052,12 +1489,19 @@ function App() {
             <div className="mt-4 rounded-lg border border-cyan-900/60 bg-slate-950/70 px-3 py-3 text-sm text-slate-200">
               <p className="font-semibold text-cyan-300">Preview: {previewStateLabel}</p>
               <p className="mt-1 text-xs text-slate-300">Timeline: {previewTimeLabel}</p>
+              <p className="mt-1 text-xs text-slate-300">Cue: {cueLabel}</p>
+              <p className="mt-1 text-xs text-slate-300">Page: {pageLabel}</p>
               <div className="mt-2 h-2 w-full overflow-hidden rounded bg-slate-800">
                 <div
                   className="h-full bg-cyan-400 transition-all"
                   style={{ width: `${previewProgressPercent}%` }}
                 />
               </div>
+              {waitingForOffset ? (
+                <p className="mt-2 text-xs text-amber-300">
+                  Waiting for offset start at {lyricsStartOffsetSec.toFixed(1)}s
+                </p>
+              ) : null}
               {previewError ? (
                 <p className="mt-2 text-xs text-red-300">{previewError}</p>
               ) : null}
