@@ -14,17 +14,19 @@ This project proves that modern browser APIs are capable of handling complex mul
 
 ## 🛠 Technical Highlights
 - **100% Client-Side:** Zero backend dependencies. All processing happens in the user's browser.
-- **Precise Audio Sync:** Utilizes robust React state management to map text characters to audio timestamps.
+- **Dual Sync Modes:** `Auto Align (Beta)` runs optional in-browser speech alignment, and `Proportional` provides a deterministic fallback.
 - **Canvas Animation:** High-performance, frame-accurate rendering of typography using native Canvas context.
 - **In-Browser Export:** Captures the Canvas stream and encodes it directly to a downloadable video file.
+- **NGO Engineering Demo:** Built as a browser-only multimedia engineering demonstrator for grant-facing technical credibility, not a niche musician-only tool.
 
 ## 🚀 How it Works (Architecture)
 1. **Input:** The user provides a text script and uploads an optional audio file.
-2. **State Management:** React calculates the duration of the audio and synchronizes the typewriter effect speed to match.
-3. **Canvas Drawing:** A `requestAnimationFrame` loop paints the text progressively onto a hidden `<canvas>` element.
-4. **Recording:** The `MediaRecorder` API captures the canvas stream (along with the audio track) and multiplexes them into a final video blob.
+2. **Optional Local Analyze:** In `Auto Align (Beta)`, audio is analyzed on-device in a Web Worker to estimate speech word timestamps.
+3. **State Management:** React builds a cue/page timeline from alignment output (or proportional fallback) and keeps preview/export in lockstep.
+4. **Canvas Drawing:** A `requestAnimationFrame` loop paints only the active cue/page with page-flip typewriter progression.
+5. **Recording:** The `MediaRecorder` API captures the canvas stream (along with the audio track) and multiplexes them into a final video blob.
 
-## 🧪 Local Test (Current Step 1)
+## 🧪 Local Test
 ```bash
 npm install
 npm run dev

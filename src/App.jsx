@@ -1,4 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  buildAlignmentFromAsrWords,
+  buildPageTimingHintsFromCue,
+  countWordsInLines,
+  splitScriptIntoCues,
+} from "./lib/alignment";
 
 const DEFAULT_SCRIPT = `This is where your voiceover script goes.
 Paste your full text here, upload audio, then preview/export.`;
@@ -16,6 +22,7 @@ const TYPEWRITER_FONT = `700 ${CANVAS_FONT_SIZE}px "Segoe UI", "Inter", sans-ser
 const PREVIEW_STATE_LABELS = {
   idle: "Ready",
   loading: "Loading audio...",
+  paused: "Preview paused",
   playing: "Playing preview",
   ended: "Preview finished",
   error: "Preview error",
@@ -30,12 +37,21 @@ const EXPORT_STATE_LABELS = {
   error: "Export error",
 };
 
+const SYNC_STATUS_LABELS = {
+  idle: "Idle",
+  analyzing: "Analyzing",
+  ready: "Ready",
+  fallback: "Fallback",
+  error: "Error",
+};
+
 const EMPTY_TYPEWRITER_STATUS = {
   cueNumber: 0,
   cueTotal: 0,
   pageNumber: 0,
   pageTotal: 0,
   inLyricsRange: false,
+  waitingForStart: false,
 };
 
 const EXPORT_MIME_CANDIDATES = {
@@ -71,6 +87,57 @@ function sanitizeFileBaseName(name) {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .toLowerCase();
+}
+
+function hashString(value) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash << 5) - hash + value.charCodeAt(index);
+    hash |= 0;
+  }
+  return String(hash);
+}
+
+function buildAlignmentCacheKey(audioFile, scriptText) {
+  if (!audioFile) return `no-audio:${hashString(scriptText)}`;
+
+  return [
+    audioFile.name,
+    audioFile.size,
+    audioFile.lastModified,
+    hashString(scriptText),
+  ].join(":");
+}
+
+async function decodeAudioFileToMonoFloat32(audioFile) {
+  const arrayBuffer = await audioFile.arrayBuffer();
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) {
+    throw new Error("AudioContext is not available in this browser.");
+  }
+
+  const audioContext = new AudioContextClass();
+
+  try {
+    const decoded = await audioContext.decodeAudioData(arrayBuffer);
+    const { numberOfChannels, length } = decoded;
+    const mono = new Float32Array(length);
+
+    for (let channelIndex = 0; channelIndex < numberOfChannels; channelIndex += 1) {
+      const channelData = decoded.getChannelData(channelIndex);
+      for (let sampleIndex = 0; sampleIndex < length; sampleIndex += 1) {
+        mono[sampleIndex] += channelData[sampleIndex] / numberOfChannels;
+      }
+    }
+
+    return {
+      samples: mono,
+      sampleRate: decoded.sampleRate,
+      duration: decoded.duration,
+    };
+  } finally {
+    await audioContext.close();
+  }
 }
 
 function waitForAudioMetadata(
@@ -198,51 +265,98 @@ function allocateWeightedDurations(weights, totalDuration, minDurationPerItem) {
 function buildTypewriterTimeline({
   scriptText,
   audioDuration,
-  lyricsStartOffsetSec,
+  textStartOffsetSec,
   maxVisibleLines,
   maxTextWidth,
   measurementCtx,
+  syncMode,
+  alignmentResult,
 }) {
   if (!scriptText.trim()) {
     return {
       cues: [],
       pages: [],
-      lyricsDurationSec: 0,
-      lyricsStartOffsetSec,
-      lyricsEndSec: lyricsStartOffsetSec,
+      startSec: textStartOffsetSec,
+      endSec: textStartOffsetSec,
+      syncSource: "proportional",
     };
   }
 
-  const normalizedText = scriptText.replace(/\r\n/g, "\n").trim();
-  const stanzas = normalizedText
-    .split(/\n\s*\n+/)
-    .map((stanza) => stanza.trim())
-    .filter(Boolean);
-
-  const cueTexts = stanzas.length ? stanzas : [normalizedText];
+  const cueTexts = splitScriptIntoCues(scriptText);
+  const safeAudioDuration = Math.max(audioDuration, 0.1);
   const cueWeights = cueTexts.map((text) => Math.max(countNonWhitespaceChars(text), 1));
-
-  const lyricsDurationSec = Math.max(
-    0.1,
-    audioDuration - Math.max(0, lyricsStartOffsetSec)
-  );
   const cueDurations = allocateWeightedDurations(
     cueWeights,
-    lyricsDurationSec,
+    safeAudioDuration,
     MIN_CUE_DURATION_SEC
   );
 
+  const proportionalCueWindows = cueDurations.map((duration, cueIndex) => {
+    const startSec =
+      cueIndex === 0
+        ? 0
+        : cueDurations.slice(0, cueIndex).reduce((sum, value) => sum + value, 0);
+    const endSec = startSec + duration;
+    return { startSec, endSec };
+  });
+
+  const alignmentCues =
+    syncMode === "auto" && alignmentResult?.source === "auto"
+      ? alignmentResult.cues ?? []
+      : [];
+
   const cues = [];
   const pages = [];
-  let cueStartRel = 0;
+  const cueBaseRanges = [];
+  let cueCursorSec = 0;
+
+  cueTexts.forEach((_, cueIndex) => {
+    const proportionalWindow = proportionalCueWindows[cueIndex];
+    const alignmentCue = alignmentCues[cueIndex];
+    let startBaseSec = proportionalWindow.startSec;
+    let endBaseSec = proportionalWindow.endSec;
+
+    if (
+      alignmentCue?.useAutoTiming &&
+      Number.isFinite(alignmentCue.startSec) &&
+      Number.isFinite(alignmentCue.endSec) &&
+      alignmentCue.endSec > alignmentCue.startSec
+    ) {
+      startBaseSec = alignmentCue.startSec;
+      endBaseSec = alignmentCue.endSec;
+    }
+
+    const cueStartCap = Math.max(0, safeAudioDuration - MIN_CUE_DURATION_SEC);
+    startBaseSec = Math.min(Math.max(startBaseSec, 0), cueStartCap);
+    startBaseSec = Math.max(startBaseSec, cueCursorSec);
+
+    endBaseSec = Math.min(
+      Math.max(endBaseSec, startBaseSec + MIN_CUE_DURATION_SEC),
+      safeAudioDuration
+    );
+    if (endBaseSec <= startBaseSec) {
+      endBaseSec = startBaseSec + MIN_CUE_DURATION_SEC;
+    }
+
+    cueBaseRanges.push({ startSec: startBaseSec, endSec: endBaseSec });
+    cueCursorSec = endBaseSec;
+  });
 
   cueTexts.forEach((cueText, cueIndex) => {
-    const cueDuration = cueDurations[cueIndex];
-    const cueEndRel = cueStartRel + cueDuration;
+    const cueBaseRange = cueBaseRanges[cueIndex];
+    const cueDuration = Math.max(
+      cueBaseRange.endSec - cueBaseRange.startSec,
+      MIN_CUE_DURATION_SEC
+    );
     const cueLines = wrapTextToLines(measurementCtx, cueText, maxTextWidth);
     const lineGroups = chunkLines(cueLines.length ? cueLines : [""], maxVisibleLines);
     const pageWeights = lineGroups.map((lines) =>
       Math.max(countNonWhitespaceChars(lines.join("")), 1)
+    );
+    const pageWordCounts = lineGroups.map((lines) => countWordsInLines(lines));
+    const pageTimingHints = buildPageTimingHintsFromCue(
+      alignmentCues[cueIndex],
+      pageWordCounts
     );
     const pageDurations = allocateWeightedDurations(
       pageWeights,
@@ -250,10 +364,44 @@ function buildTypewriterTimeline({
       MIN_PAGE_DURATION_SEC
     );
 
-    let pageStartRel = cueStartRel;
+    let proportionalPageStartSec = cueBaseRange.startSec;
+    let pageCursorSec = cueBaseRange.startSec;
     const cuePages = lineGroups.map((lines, pageIndexInCue) => {
       const pageDuration = pageDurations[pageIndexInCue];
-      const pageEndRel = pageStartRel + pageDuration;
+      const proportionalPageEndSec = proportionalPageStartSec + pageDuration;
+      const timingHint = pageTimingHints?.[pageIndexInCue] ?? null;
+
+      let startBaseSec = proportionalPageStartSec;
+      let endBaseSec = proportionalPageEndSec;
+
+      if (
+        timingHint &&
+        Number.isFinite(timingHint.startSec) &&
+        Number.isFinite(timingHint.endSec) &&
+        timingHint.endSec > timingHint.startSec
+      ) {
+        startBaseSec = timingHint.startSec;
+        endBaseSec = timingHint.endSec;
+      }
+
+      const pageStartCap = Math.max(
+        cueBaseRange.startSec,
+        cueBaseRange.endSec - MIN_PAGE_DURATION_SEC
+      );
+      startBaseSec = Math.min(
+        Math.max(startBaseSec, cueBaseRange.startSec),
+        pageStartCap
+      );
+      startBaseSec = Math.max(startBaseSec, pageCursorSec);
+
+      endBaseSec = Math.min(
+        Math.max(endBaseSec, startBaseSec + MIN_PAGE_DURATION_SEC),
+        cueBaseRange.endSec
+      );
+      if (endBaseSec <= startBaseSec) {
+        endBaseSec = startBaseSec + MIN_PAGE_DURATION_SEC;
+      }
+
       const lineCharCounts = lines.map((line) => line.length);
       const totalChars = Math.max(
         1,
@@ -264,52 +412,50 @@ function buildTypewriterTimeline({
         lines,
         text: lines.join("\n"),
         charWeight: pageWeights[pageIndexInCue],
-        startRel: pageStartRel,
-        endRel: pageEndRel,
-        startSec: lyricsStartOffsetSec + pageStartRel,
-        endSec: lyricsStartOffsetSec + pageEndRel,
+        startBaseSec,
+        endBaseSec,
+        startSec: startBaseSec + textStartOffsetSec,
+        endSec: endBaseSec + textStartOffsetSec,
         cueIndex,
         pageIndexInCue,
         lineCharCounts,
         totalChars,
+        source: timingHint ? "auto" : "proportional",
       };
 
-      pageStartRel = pageEndRel;
+      proportionalPageStartSec = proportionalPageEndSec;
+      pageCursorSec = endBaseSec;
       return pageModel;
     });
+
+    if (cuePages.length) {
+      cuePages[cuePages.length - 1].endBaseSec = cueBaseRange.endSec;
+      cuePages[cuePages.length - 1].endSec = cueBaseRange.endSec + textStartOffsetSec;
+    }
 
     cuePages.forEach((pageModel) => pages.push(pageModel));
     cues.push({
       text: cueText,
-      startRel: cueStartRel,
-      endRel: cueEndRel,
-      startSec: lyricsStartOffsetSec + cueStartRel,
-      endSec: lyricsStartOffsetSec + cueEndRel,
+      startBaseSec: cueBaseRange.startSec,
+      endBaseSec: cueBaseRange.endSec,
+      startSec: cueBaseRange.startSec + textStartOffsetSec,
+      endSec: cueBaseRange.endSec + textStartOffsetSec,
       charWeight: cueWeights[cueIndex],
       pages: cuePages,
+      source: alignmentCues[cueIndex]?.useAutoTiming ? "auto" : "proportional",
+      qualityFlag: alignmentCues[cueIndex]?.useAutoTiming ? "auto" : "fallback",
     });
-
-    cueStartRel = cueEndRel;
   });
-
-  if (pages.length) {
-    const lastPage = pages[pages.length - 1];
-    lastPage.endRel = lyricsDurationSec;
-    lastPage.endSec = lyricsStartOffsetSec + lyricsDurationSec;
-  }
-
-  if (cues.length) {
-    const lastCue = cues[cues.length - 1];
-    lastCue.endRel = lyricsDurationSec;
-    lastCue.endSec = lyricsStartOffsetSec + lyricsDurationSec;
-  }
 
   return {
     cues,
     pages,
-    lyricsDurationSec,
-    lyricsStartOffsetSec,
-    lyricsEndSec: lyricsStartOffsetSec + lyricsDurationSec,
+    startSec: pages[0]?.startSec ?? textStartOffsetSec,
+    endSec: pages[pages.length - 1]?.endSec ?? textStartOffsetSec,
+    syncSource:
+      syncMode === "auto" && alignmentResult?.source === "auto"
+        ? "auto"
+        : "proportional",
   };
 }
 
@@ -323,13 +469,15 @@ function resolvePageRenderState(timelineModel, currentAudioTime) {
       cueTotal: 0,
       pageNumber: 0,
       pageTotal: 0,
+      waitingForStart: false,
     };
   }
 
-  const lyricsTimeRel = currentAudioTime - timelineModel.lyricsStartOffsetSec;
+  const firstPage = timelineModel.pages[0];
+  const lastPage = timelineModel.pages[timelineModel.pages.length - 1];
   const cueTotal = timelineModel.cues.length;
 
-  if (lyricsTimeRel < 0) {
+  if (currentAudioTime < firstPage.startSec) {
     return {
       activePage: null,
       pageProgress: 0,
@@ -338,29 +486,27 @@ function resolvePageRenderState(timelineModel, currentAudioTime) {
       cueTotal,
       pageNumber: 0,
       pageTotal: 0,
+      waitingForStart: true,
     };
   }
 
-  const clampedRelTime = Math.min(
-    Math.max(lyricsTimeRel, 0),
-    timelineModel.lyricsDurationSec
-  );
+  const clampedTime = Math.min(Math.max(currentAudioTime, firstPage.startSec), lastPage.endSec);
 
-  let activePage = timelineModel.pages[timelineModel.pages.length - 1];
+  let activePage = lastPage;
   for (const candidatePage of timelineModel.pages) {
-    if (clampedRelTime < candidatePage.endRel) {
+    if (clampedTime < candidatePage.endSec) {
       activePage = candidatePage;
       break;
     }
   }
 
   const activeCue = timelineModel.cues[activePage.cueIndex];
-  const cueDuration = Math.max(activeCue.endRel - activeCue.startRel, 0.0001);
-  const pageDuration = Math.max(activePage.endRel - activePage.startRel, 0.0001);
+  const cueDuration = Math.max(activeCue.endSec - activeCue.startSec, 0.0001);
+  const pageDuration = Math.max(activePage.endSec - activePage.startSec, 0.0001);
   const pageProgress =
-    clampedRelTime >= timelineModel.lyricsDurationSec
+    clampedTime >= lastPage.endSec
       ? 1
-      : clamp01((clampedRelTime - activePage.startRel) / pageDuration);
+      : clamp01((clampedTime - activePage.startSec) / pageDuration);
 
   return {
     activePage,
@@ -370,7 +516,8 @@ function resolvePageRenderState(timelineModel, currentAudioTime) {
     cueTotal,
     pageNumber: activePage.pageIndexInCue + 1,
     pageTotal: activeCue.pages.length,
-    cueProgress: clamp01((clampedRelTime - activeCue.startRel) / cueDuration),
+    cueProgress: clamp01((clampedTime - activeCue.startSec) / cueDuration),
+    waitingForStart: false,
   };
 }
 
@@ -563,9 +710,12 @@ function App() {
   const [scriptText, setScriptText] = useState(DEFAULT_SCRIPT);
   const [audioFile, setAudioFile] = useState(null);
   const [animationStyle, setAnimationStyle] = useState("typewriter");
+  const [syncMode, setSyncMode] = useState("auto");
+  const [syncStatus, setSyncStatus] = useState("idle");
+  const [syncMessage, setSyncMessage] = useState("");
   const [exportFormat, setExportFormat] = useState("webm");
   const [maxVisibleLines, setMaxVisibleLines] = useState(4);
-  const [lyricsStartOffsetSec, setLyricsStartOffsetSec] = useState(0);
+  const [textStartOffsetSec, setTextStartOffsetSec] = useState(0);
 
   const [previewState, setPreviewState] = useState("idle");
   const [previewError, setPreviewError] = useState("");
@@ -579,6 +729,7 @@ function App() {
   const [exportError, setExportError] = useState("");
   const [exportDownloadUrl, setExportDownloadUrl] = useState("");
   const [exportFileName, setExportFileName] = useState("");
+  const [alignmentResultState, setAlignmentResultState] = useState(null);
 
   const canvasRef = useRef(null);
   const animationFrameRef = useRef(null);
@@ -591,6 +742,11 @@ function App() {
   const exportSessionRef = useRef(0);
   const measureCanvasRef = useRef(null);
   const typewriterTimelineCacheRef = useRef(null);
+  const alignmentCacheRef = useRef(new Map());
+  const alignmentResultRef = useRef(null);
+  const alignmentWorkerRef = useRef(null);
+  const alignmentRequestRef = useRef(0);
+  const previewModeRef = useRef(null);
 
   const selectedExportMimeType = useMemo(
     () => pickSupportedMimeType(exportFormat),
@@ -615,6 +771,7 @@ function App() {
   const previewProgressPercent =
     durationSeconds > 0 ? clamp01(playheadSeconds / durationSeconds) * 100 : 0;
   const exportStateLabel = EXPORT_STATE_LABELS[exportState] ?? "Unknown";
+  const syncStatusLabel = SYNC_STATUS_LABELS[syncStatus] ?? "Unknown";
   const cueLabel =
     animationStyle !== "typewriter"
       ? "n/a (karaoke)"
@@ -629,9 +786,8 @@ function App() {
       : "0/0";
   const waitingForOffset =
     animationStyle === "typewriter" &&
-    previewState === "playing" &&
-    !typewriterStatus.inLyricsRange &&
-    playheadSeconds < lyricsStartOffsetSec;
+    (previewState === "playing" || previewState === "paused") &&
+    typewriterStatus.waitingForStart;
 
   const clearExportArtifact = useCallback(() => {
     if (exportDownloadUrlRef.current) {
@@ -667,10 +823,17 @@ function App() {
     releaseAudioResources();
   }, [cancelRenderLoop, releaseAudioResources]);
 
+  const setActiveAlignmentResult = useCallback((nextAlignment) => {
+    alignmentResultRef.current = nextAlignment;
+    setAlignmentResultState(nextAlignment);
+    typewriterTimelineCacheRef.current = null;
+  }, []);
+
   const resetInteractionState = useCallback(() => {
     previewSessionRef.current += 1;
     exportSessionRef.current += 1;
     stopPreview();
+    previewModeRef.current = null;
     clearExportArtifact();
     setPreviewState("idle");
     setExportState("idle");
@@ -679,7 +842,13 @@ function App() {
     setPlayheadSeconds(0);
     setDurationSeconds(0);
     setTypewriterStatus(EMPTY_TYPEWRITER_STATUS);
-  }, [clearExportArtifact, stopPreview]);
+    setSyncMessage("");
+    if (animationStyle === "typewriter") {
+      setSyncStatus(syncMode === "auto" ? "idle" : "ready");
+    } else {
+      setSyncStatus("idle");
+    }
+  }, [animationStyle, clearExportArtifact, stopPreview, syncMode]);
 
   const getMeasurementContext = useCallback(() => {
     if (!measureCanvasRef.current) {
@@ -697,14 +866,20 @@ function App() {
   const getTypewriterTimeline = useCallback(
     (duration, maxTextWidth) => {
       const safeDuration = Number.isFinite(duration) ? Math.max(duration, 0.1) : 0.1;
+      const activeAlignment =
+        syncMode === "auto" ? alignmentResultRef.current : null;
+      const alignmentCacheKey =
+        activeAlignment?.cacheKey ?? `${syncMode}:no-alignment`;
       const cache = typewriterTimelineCacheRef.current;
       const cacheHit =
         cache &&
         cache.scriptText === scriptText &&
         cache.duration === safeDuration &&
         cache.maxVisibleLines === maxVisibleLines &&
-        cache.lyricsStartOffsetSec === lyricsStartOffsetSec &&
-        cache.maxTextWidth === maxTextWidth;
+        cache.textStartOffsetSec === textStartOffsetSec &&
+        cache.maxTextWidth === maxTextWidth &&
+        cache.syncMode === syncMode &&
+        cache.alignmentCacheKey === alignmentCacheKey;
 
       if (cacheHit) return cache.model;
 
@@ -713,33 +888,243 @@ function App() {
         return {
           cues: [],
           pages: [],
-          lyricsDurationSec: 0,
-          lyricsStartOffsetSec,
-          lyricsEndSec: lyricsStartOffsetSec,
+          startSec: textStartOffsetSec,
+          endSec: textStartOffsetSec,
+          syncSource: "proportional",
         };
       }
 
       const timelineModel = buildTypewriterTimeline({
         scriptText,
         audioDuration: safeDuration,
-        lyricsStartOffsetSec,
+        textStartOffsetSec,
         maxVisibleLines,
         maxTextWidth,
         measurementCtx,
+        syncMode,
+        alignmentResult: activeAlignment,
       });
 
       typewriterTimelineCacheRef.current = {
         scriptText,
         duration: safeDuration,
         maxVisibleLines,
-        lyricsStartOffsetSec,
+        textStartOffsetSec,
         maxTextWidth,
+        syncMode,
+        alignmentCacheKey,
         model: timelineModel,
       };
 
       return timelineModel;
     },
-    [getMeasurementContext, lyricsStartOffsetSec, maxVisibleLines, scriptText]
+    [
+      getMeasurementContext,
+      maxVisibleLines,
+      scriptText,
+      syncMode,
+      textStartOffsetSec,
+    ]
+  );
+
+  const getAlignmentWorker = useCallback(() => {
+    if (!alignmentWorkerRef.current) {
+      alignmentWorkerRef.current = new Worker(
+        new URL("./workers/alignmentWorker.js", import.meta.url),
+        { type: "module" }
+      );
+    }
+
+    return alignmentWorkerRef.current;
+  }, []);
+
+  const transcribeWithAlignmentWorker = useCallback(
+    ({ samples, sampleRate }) => {
+      const worker = getAlignmentWorker();
+      const requestId = alignmentRequestRef.current + 1;
+      alignmentRequestRef.current = requestId;
+
+      return new Promise((resolve, reject) => {
+        const handleMessage = (event) => {
+          const payload = event.data;
+          if (!payload || payload.requestId !== requestId) return;
+
+          if (payload.type === "alignment-result") {
+            cleanup();
+            resolve(Array.isArray(payload.words) ? payload.words : []);
+          } else if (payload.type === "alignment-error") {
+            cleanup();
+            reject(new Error(payload.error || "Alignment worker failed."));
+          }
+        };
+
+        const handleError = () => {
+          cleanup();
+          reject(new Error("Alignment worker crashed."));
+        };
+
+        const cleanup = () => {
+          worker.removeEventListener("message", handleMessage);
+          worker.removeEventListener("error", handleError);
+        };
+
+        worker.addEventListener("message", handleMessage);
+        worker.addEventListener("error", handleError);
+
+        worker.postMessage(
+          {
+            type: "align",
+            requestId,
+            sampleRate,
+            samples: samples.buffer,
+          },
+          [samples.buffer]
+        );
+      });
+    },
+    [getAlignmentWorker]
+  );
+
+  const prepareAlignmentForSession = useCallback(
+    async ({ currentAudioFile, sessionId }) => {
+      if (animationStyle !== "typewriter") {
+        setActiveAlignmentResult(null);
+        setSyncStatus("idle");
+        setSyncMessage("");
+        return null;
+      }
+
+      if (syncMode !== "auto") {
+        const proportionalResult = {
+          source: "proportional",
+          cacheKey: `manual:${buildAlignmentCacheKey(currentAudioFile, scriptText)}`,
+          cues: [],
+          wordTimings: [],
+          quality: { matchedRatio: 0, fallbackCueCount: 0 },
+        };
+        setActiveAlignmentResult(proportionalResult);
+        setSyncStatus("ready");
+        setSyncMessage("Manual proportional timing.");
+        return proportionalResult;
+      }
+
+      if (!currentAudioFile) {
+        const fallbackNoAudio = {
+          source: "proportional",
+          cacheKey: `no-audio:${hashString(scriptText)}`,
+          cues: [],
+          wordTimings: [],
+          quality: { matchedRatio: 0, fallbackCueCount: 0 },
+        };
+        setActiveAlignmentResult(fallbackNoAudio);
+        setSyncStatus("fallback");
+        setSyncMessage("No audio uploaded. Falling back to proportional timing.");
+        return fallbackNoAudio;
+      }
+
+      const cacheKey = buildAlignmentCacheKey(currentAudioFile, scriptText);
+      const cached = alignmentCacheRef.current.get(cacheKey);
+      if (cached) {
+        setActiveAlignmentResult(cached);
+        setSyncStatus(cached.source === "auto" ? "ready" : "fallback");
+        setSyncMessage(
+          cached.source === "auto"
+            ? `Auto alignment cached (${Math.round(
+                (cached.quality?.matchedRatio ?? 0) * 100
+              )}% matched).`
+            : cached.reason || "Auto alignment unavailable. Using proportional timing."
+        );
+        return cached;
+      }
+
+      setSyncStatus("analyzing");
+      setSyncMessage("Analyzing speech alignment in browser...");
+
+      try {
+        const decoded = await decodeAudioFileToMonoFloat32(currentAudioFile);
+        if (
+          sessionId !== previewSessionRef.current &&
+          sessionId !== exportSessionRef.current
+        ) {
+          return null;
+        }
+
+        const asrWords = await transcribeWithAlignmentWorker({
+          samples: decoded.samples,
+          sampleRate: decoded.sampleRate,
+        });
+
+        if (
+          sessionId !== previewSessionRef.current &&
+          sessionId !== exportSessionRef.current
+        ) {
+          return null;
+        }
+
+        const alignment = buildAlignmentFromAsrWords({
+          scriptText,
+          asrWords,
+        });
+
+        const hasUsableAuto =
+          alignment.wordTimings.length > 0 && (alignment.quality?.matchedRatio ?? 0) >= 0.12;
+
+        const result = hasUsableAuto
+          ? {
+              source: "auto",
+              cacheKey,
+              cues: alignment.cues,
+              wordTimings: alignment.wordTimings,
+              quality: alignment.quality,
+            }
+          : {
+              source: "proportional",
+              cacheKey,
+              cues: alignment.cues,
+              wordTimings: alignment.wordTimings,
+              quality: alignment.quality,
+              reason:
+                "Auto alignment quality was too low. Falling back to proportional timing.",
+            };
+
+        alignmentCacheRef.current.set(cacheKey, result);
+        setActiveAlignmentResult(result);
+        setSyncStatus(result.source === "auto" ? "ready" : "fallback");
+        setSyncMessage(
+          result.source === "auto"
+            ? `Auto alignment ready (${Math.round(
+                (result.quality?.matchedRatio ?? 0) * 100
+              )}% matched).`
+            : result.reason
+        );
+        return result;
+      } catch (error) {
+        const fallbackError = {
+          source: "proportional",
+          cacheKey,
+          cues: [],
+          wordTimings: [],
+          quality: { matchedRatio: 0, fallbackCueCount: 0 },
+          reason:
+            error instanceof Error
+              ? `${error.message} Using proportional timing fallback.`
+              : "Alignment failed. Using proportional timing fallback.",
+        };
+
+        alignmentCacheRef.current.set(cacheKey, fallbackError);
+        setActiveAlignmentResult(fallbackError);
+        setSyncStatus("fallback");
+        setSyncMessage(fallbackError.reason);
+        return fallbackError;
+      }
+    },
+    [
+      animationStyle,
+      scriptText,
+      setActiveAlignmentResult,
+      syncMode,
+      transcribeWithAlignmentWorker,
+    ]
   );
 
   const drawFrame = useCallback(
@@ -801,6 +1186,7 @@ function App() {
           pageNumber: renderState.pageNumber ?? 0,
           pageTotal: renderState.pageTotal ?? 0,
           inLyricsRange: renderState.inLyricsRange ?? false,
+          waitingForStart: renderState.waitingForStart ?? false,
         };
       }
 
@@ -831,125 +1217,9 @@ function App() {
     [animationStyle, getTypewriterTimeline, scriptText]
   );
 
-  const runSilentPreviewLoop = useCallback(
+  const runAudioPreviewLoop = useCallback(
     (duration, previewSessionId) => {
-      setPreviewState("playing");
-      const initialRender = drawFrame(0, duration, { isPlaying: true, showHud: true });
-      setTypewriterStatus(initialRender.typewriterStatus);
-      fallbackStartTimeRef.current = performance.now();
-
-      const stepWithoutAudio = (now) => {
-        if (previewSessionId !== previewSessionRef.current) {
-          animationFrameRef.current = null;
-          return;
-        }
-
-        const elapsedSeconds = (now - fallbackStartTimeRef.current) / 1000;
-        const clampedTime = Math.min(elapsedSeconds, duration);
-
-        const renderMeta = drawFrame(clampedTime, duration, {
-          isPlaying: true,
-          showHud: true,
-        });
-
-        if (now - lastUiSyncRef.current >= 120 || clampedTime >= duration) {
-          setPlayheadSeconds(clampedTime);
-          setTypewriterStatus(renderMeta.typewriterStatus);
-          lastUiSyncRef.current = now;
-        }
-
-        if (clampedTime >= duration) {
-          setPreviewState("ended");
-          const finalRender = drawFrame(duration, duration, {
-            isPlaying: false,
-            showHud: true,
-          });
-          setTypewriterStatus(finalRender.typewriterStatus);
-          animationFrameRef.current = null;
-          return;
-        }
-
-        animationFrameRef.current = requestAnimationFrame(stepWithoutAudio);
-      };
-
-      animationFrameRef.current = requestAnimationFrame(stepWithoutAudio);
-    },
-    [drawFrame]
-  );
-
-  const handlePreview = useCallback(async () => {
-    if (isExporting) return;
-
-    const previewSessionId = previewSessionRef.current + 1;
-    previewSessionRef.current = previewSessionId;
-
-    setPreviewError("");
-
-    if (!scriptText.trim()) {
-      setPreviewState("error");
-      setPreviewError("Please enter text before starting preview.");
-      return;
-    }
-
-    stopPreview();
-    lastUiSyncRef.current = 0;
-    setPlayheadSeconds(0);
-    setTypewriterStatus(EMPTY_TYPEWRITER_STATUS);
-
-    if (!audioFile) {
-      const fallbackDuration = Math.min(Math.max(scriptText.length / 14, 3), 24);
-      setDurationSeconds(fallbackDuration);
-      runSilentPreviewLoop(fallbackDuration, previewSessionId);
-      return;
-    }
-
-    try {
-      setPreviewState("loading");
-      const objectUrl = URL.createObjectURL(audioFile);
-      audioObjectUrlRef.current = objectUrl;
-
-      const audio = new Audio(objectUrl);
-      audio.preload = "auto";
-      audioElementRef.current = audio;
-      await waitForAudioMetadata(audio, AUDIO_METADATA_TIMEOUT_MS);
-
-      if (previewSessionId !== previewSessionRef.current) {
-        return;
-      }
-
-      const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
-      if (duration <= 0) {
-        throw new Error("Audio duration could not be determined.");
-      }
-
-      setDurationSeconds(duration);
-      const firstFrameMeta = drawFrame(0, duration, {
-        isPlaying: false,
-        showHud: true,
-      });
-      setTypewriterStatus(firstFrameMeta.typewriterStatus);
-
-      let playbackStarted = false;
-      try {
-        await audio.play();
-        playbackStarted = true;
-      } catch (playbackError) {
-        setPreviewError(
-          playbackError instanceof Error
-            ? `${playbackError.message} Running visual-only preview.`
-            : "Audio playback was blocked. Running visual-only preview."
-        );
-      }
-
-      if (previewSessionId !== previewSessionRef.current) {
-        return;
-      }
-
-      if (!playbackStarted) {
-        runSilentPreviewLoop(duration, previewSessionId);
-        return;
-      }
-
+      previewModeRef.current = "audio";
       setPreviewState("playing");
 
       const stepWithAudio = (now) => {
@@ -984,6 +1254,7 @@ function App() {
             showHud: true,
           });
           setTypewriterStatus(finalRender.typewriterStatus);
+          previewModeRef.current = null;
           stopPreview();
           return;
         }
@@ -992,25 +1263,242 @@ function App() {
       };
 
       animationFrameRef.current = requestAnimationFrame(stepWithAudio);
+    },
+    [drawFrame, stopPreview]
+  );
+
+  const runSilentPreviewLoop = useCallback(
+    (duration, previewSessionId, startAtSec = 0) => {
+      previewModeRef.current = "silent";
+      setPreviewState("playing");
+      const initialRender = drawFrame(startAtSec, duration, {
+        isPlaying: true,
+        showHud: true,
+      });
+      setTypewriterStatus(initialRender.typewriterStatus);
+      fallbackStartTimeRef.current = performance.now() - startAtSec * 1000;
+
+      const stepWithoutAudio = (now) => {
+        if (previewSessionId !== previewSessionRef.current) {
+          animationFrameRef.current = null;
+          return;
+        }
+
+        const elapsedSeconds = (now - fallbackStartTimeRef.current) / 1000;
+        const clampedTime = Math.min(elapsedSeconds, duration);
+
+        const renderMeta = drawFrame(clampedTime, duration, {
+          isPlaying: true,
+          showHud: true,
+        });
+
+        if (now - lastUiSyncRef.current >= 120 || clampedTime >= duration) {
+          setPlayheadSeconds(clampedTime);
+          setTypewriterStatus(renderMeta.typewriterStatus);
+          lastUiSyncRef.current = now;
+        }
+
+        if (clampedTime >= duration) {
+          setPreviewState("ended");
+          const finalRender = drawFrame(duration, duration, {
+            isPlaying: false,
+            showHud: true,
+          });
+          setTypewriterStatus(finalRender.typewriterStatus);
+          previewModeRef.current = null;
+          animationFrameRef.current = null;
+          return;
+        }
+
+        animationFrameRef.current = requestAnimationFrame(stepWithoutAudio);
+      };
+
+      animationFrameRef.current = requestAnimationFrame(stepWithoutAudio);
+    },
+    [drawFrame]
+  );
+
+  const handlePreview = useCallback(async () => {
+    if (isExporting) return;
+
+    const previewSessionId = previewSessionRef.current + 1;
+    previewSessionRef.current = previewSessionId;
+
+    setPreviewError("");
+
+    if (!scriptText.trim()) {
+      setPreviewState("error");
+      setPreviewError("Please enter text before starting preview.");
+      return;
+    }
+
+    stopPreview();
+    previewModeRef.current = null;
+    lastUiSyncRef.current = 0;
+    setPlayheadSeconds(0);
+    setTypewriterStatus(EMPTY_TYPEWRITER_STATUS);
+
+    if (!audioFile) {
+      const fallbackDuration = Math.min(Math.max(scriptText.length / 14, 3), 24);
+      setDurationSeconds(fallbackDuration);
+      await prepareAlignmentForSession({
+        currentAudioFile: null,
+        sessionId: previewSessionId,
+      });
+
+      if (previewSessionId !== previewSessionRef.current) return;
+      runSilentPreviewLoop(fallbackDuration, previewSessionId, 0);
+      return;
+    }
+
+    try {
+      setPreviewState("loading");
+      const objectUrl = URL.createObjectURL(audioFile);
+      audioObjectUrlRef.current = objectUrl;
+
+      const audio = new Audio(objectUrl);
+      audio.preload = "auto";
+      audioElementRef.current = audio;
+      await waitForAudioMetadata(audio, AUDIO_METADATA_TIMEOUT_MS);
+
+      if (previewSessionId !== previewSessionRef.current) {
+        return;
+      }
+
+      const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
+      if (duration <= 0) {
+        throw new Error("Audio duration could not be determined.");
+      }
+
+      setDurationSeconds(duration);
+
+      await prepareAlignmentForSession({
+        currentAudioFile: audioFile,
+        sessionId: previewSessionId,
+      });
+
+      if (previewSessionId !== previewSessionRef.current) {
+        return;
+      }
+
+      const firstFrameMeta = drawFrame(0, duration, {
+        isPlaying: false,
+        showHud: true,
+      });
+      setTypewriterStatus(firstFrameMeta.typewriterStatus);
+
+      let playbackStarted = false;
+      try {
+        await audio.play();
+        playbackStarted = true;
+      } catch (playbackError) {
+        setPreviewError(
+          playbackError instanceof Error
+            ? `${playbackError.message} Running visual-only preview.`
+            : "Audio playback was blocked. Running visual-only preview."
+        );
+      }
+
+      if (previewSessionId !== previewSessionRef.current) {
+        return;
+      }
+
+      if (!playbackStarted) {
+        runSilentPreviewLoop(duration, previewSessionId, 0);
+        return;
+      }
+
+      runAudioPreviewLoop(duration, previewSessionId);
     } catch (error) {
       if (previewSessionId !== previewSessionRef.current) {
         return;
       }
+      previewModeRef.current = null;
       stopPreview();
       setPreviewState("error");
       setPreviewError(
         error instanceof Error ? error.message : "Preview could not be started."
       );
       setTypewriterStatus(EMPTY_TYPEWRITER_STATUS);
+      setSyncStatus("error");
+      setSyncMessage(
+        error instanceof Error ? error.message : "Alignment or preview setup failed."
+      );
     }
   }, [
     audioFile,
     drawFrame,
     isExporting,
+    prepareAlignmentForSession,
+    runAudioPreviewLoop,
     runSilentPreviewLoop,
     scriptText,
     stopPreview,
   ]);
+
+  const handlePauseResumePreview = useCallback(async () => {
+    if (isExporting || previewState === "loading") return;
+
+    if (previewState === "playing") {
+      cancelRenderLoop();
+      const activeAudio = audioElementRef.current;
+      if (activeAudio) {
+        activeAudio.pause();
+      }
+      setPreviewState("paused");
+      return;
+    }
+
+    if (previewState !== "paused") return;
+
+    const duration = durationSeconds > 0 ? durationSeconds : 5;
+    const previewSessionId = previewSessionRef.current;
+    lastUiSyncRef.current = 0;
+
+    if (previewModeRef.current === "audio" && audioElementRef.current) {
+      try {
+        await audioElementRef.current.play();
+        runAudioPreviewLoop(duration, previewSessionId);
+      } catch (error) {
+        setPreviewError(
+          error instanceof Error
+            ? `${error.message} Resuming visual-only preview.`
+            : "Resume playback was blocked. Continuing visual-only preview."
+        );
+        runSilentPreviewLoop(duration, previewSessionId, playheadSeconds);
+      }
+      return;
+    }
+
+    runSilentPreviewLoop(duration, previewSessionId, playheadSeconds);
+  }, [
+    cancelRenderLoop,
+    durationSeconds,
+    isExporting,
+    playheadSeconds,
+    previewState,
+    runAudioPreviewLoop,
+    runSilentPreviewLoop,
+  ]);
+
+  const handleStopPreviewPlayback = useCallback(() => {
+    cancelRenderLoop();
+
+    if (audioElementRef.current) {
+      audioElementRef.current.pause();
+      audioElementRef.current.currentTime = 0;
+    }
+
+    previewModeRef.current = null;
+    setPlayheadSeconds(0);
+    setPreviewState("idle");
+    const duration = durationSeconds > 0 ? durationSeconds : 5;
+    const renderMeta = drawFrame(0, duration, {
+      isPlaying: false,
+      showHud: true,
+    });
+    setTypewriterStatus(renderMeta.typewriterStatus);
+  }, [cancelRenderLoop, drawFrame, durationSeconds]);
 
   const handleExport = useCallback(async () => {
     if (isExporting) return;
@@ -1095,6 +1583,15 @@ function App() {
       }
 
       setDurationSeconds(duration);
+      await prepareAlignmentForSession({
+        currentAudioFile: audioFile ?? null,
+        sessionId: exportSessionId,
+      });
+
+      if (exportSessionId !== exportSessionRef.current) {
+        return;
+      }
+
       const initialExportFrame = drawFrame(0, duration, {
         isPlaying: false,
         showHud: false,
@@ -1281,6 +1778,7 @@ function App() {
     drawFrame,
     exportFormat,
     isExporting,
+    prepareAlignmentForSession,
     scriptText,
     selectedExportMimeType,
     stopPreview,
@@ -1289,6 +1787,7 @@ function App() {
   useEffect(() => {
     if (
       previewState === "playing" ||
+      previewState === "paused" ||
       previewState === "loading" ||
       isExporting
     ) {
@@ -1305,11 +1804,54 @@ function App() {
   }, [drawFrame, durationSeconds, isExporting, previewState]);
 
   useEffect(() => {
+    typewriterTimelineCacheRef.current = null;
+
+    if (animationStyle !== "typewriter") {
+      setSyncStatus("idle");
+      setSyncMessage("");
+      return;
+    }
+
+    if (syncMode === "proportional") {
+      setSyncStatus("ready");
+      setSyncMessage("Manual proportional timing.");
+      return;
+    }
+
+    setSyncStatus(audioFile ? "idle" : "fallback");
+    setSyncMessage(
+      audioFile
+        ? "Auto alignment will run on preview/export start."
+        : "Upload audio to enable auto alignment."
+    );
+  }, [animationStyle, audioFile, syncMode]);
+
+  useEffect(() => {
+    typewriterTimelineCacheRef.current = null;
+    if (syncMode === "auto") {
+      setActiveAlignmentResult(null);
+      if (animationStyle === "typewriter") {
+        setSyncStatus(audioFile ? "idle" : "fallback");
+        setSyncMessage(
+          audioFile
+            ? "Script changed. Auto alignment will re-run on next preview/export."
+            : "Upload audio to enable auto alignment."
+        );
+      }
+    }
+  }, [animationStyle, audioFile, scriptText, syncMode, setActiveAlignmentResult]);
+
+  useEffect(() => {
     return () => {
       previewSessionRef.current += 1;
       exportSessionRef.current += 1;
       stopPreview();
       clearExportArtifact();
+
+      if (alignmentWorkerRef.current) {
+        alignmentWorkerRef.current.terminate();
+        alignmentWorkerRef.current = null;
+      }
     };
   }, [clearExportArtifact, stopPreview]);
 
@@ -1322,6 +1864,8 @@ function App() {
 
     resetInteractionState();
     setAudioFile(file);
+    setActiveAlignmentResult(null);
+    typewriterTimelineCacheRef.current = null;
   };
 
   const handleMaxVisibleLinesChange = (event) => {
@@ -1329,16 +1873,22 @@ function App() {
     setMaxVisibleLines(value);
   };
 
-  const handleLyricsOffsetChange = (event) => {
+  const handleTextOffsetChange = (event) => {
     const nextOffset = clampRange(Number(event.target.value), -5, 15);
-    setLyricsStartOffsetSec(nextOffset);
+    setTextStartOffsetSec(nextOffset);
   };
 
   const settingsLocked =
-    previewState === "playing" || previewState === "loading" || isExporting;
+    previewState === "playing" ||
+    previewState === "paused" ||
+    previewState === "loading" ||
+    isExporting;
   const exportButtonDisabled =
     isExporting || previewState === "loading" || !selectedExportMimeType;
   const previewButtonDisabled = isExporting || previewState === "loading";
+  const pauseResumeDisabled = previewState !== "playing" && previewState !== "paused";
+  const stopPreviewDisabled =
+    previewState === "idle" && playheadSeconds <= 0 && !audioFile;
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
@@ -1381,6 +1931,21 @@ function App() {
 
             <div className="mt-5">
               <label className="mb-2 block text-sm font-semibold text-slate-200">
+                Sync Mode (Typewriter)
+              </label>
+              <select
+                value={syncMode}
+                onChange={(event) => setSyncMode(event.target.value)}
+                disabled={animationStyle !== "typewriter" || settingsLocked}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-400 disabled:opacity-60"
+              >
+                <option value="auto">Auto Align (Beta)</option>
+                <option value="proportional">Proportional (Fallback)</option>
+              </select>
+            </div>
+
+            <div className="mt-5">
+              <label className="mb-2 block text-sm font-semibold text-slate-200">
                 Max Visible Lines (Typewriter)
               </label>
               <select
@@ -1399,21 +1964,21 @@ function App() {
 
             <div className="mt-5">
               <label className="mb-2 block text-sm font-semibold text-slate-200">
-                Lyrics Start Offset (sec)
+                Text Start Offset (sec)
               </label>
               <input
                 type="range"
                 min="-5"
                 max="15"
                 step="0.1"
-                value={lyricsStartOffsetSec}
-                onChange={handleLyricsOffsetChange}
+                value={textStartOffsetSec}
+                onChange={handleTextOffsetChange}
                 disabled={animationStyle !== "typewriter" || settingsLocked}
                 className="w-full accent-cyan-400 disabled:opacity-60"
               />
               <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
                 <span>-5.0s</span>
-                <span>{lyricsStartOffsetSec.toFixed(1)}s</span>
+                <span>{textStartOffsetSec.toFixed(1)}s</span>
                 <span>+15.0s</span>
               </div>
             </div>
@@ -1461,6 +2026,22 @@ function App() {
               </button>
               <button
                 type="button"
+                onClick={handlePauseResumePreview}
+                disabled={pauseResumeDisabled || isExporting}
+                className="min-w-[120px] rounded-xl bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {previewState === "paused" ? "Resume" : "Pause"}
+              </button>
+              <button
+                type="button"
+                onClick={handleStopPreviewPlayback}
+                disabled={stopPreviewDisabled || isExporting}
+                className="min-w-[120px] rounded-xl bg-slate-700 px-4 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Stop
+              </button>
+              <button
+                type="button"
                 onClick={handleExport}
                 disabled={exportButtonDisabled}
                 className="min-w-[120px] rounded-xl bg-orange-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-60"
@@ -1489,6 +2070,7 @@ function App() {
             <div className="mt-4 rounded-lg border border-cyan-900/60 bg-slate-950/70 px-3 py-3 text-sm text-slate-200">
               <p className="font-semibold text-cyan-300">Preview: {previewStateLabel}</p>
               <p className="mt-1 text-xs text-slate-300">Timeline: {previewTimeLabel}</p>
+              <p className="mt-1 text-xs text-slate-300">Sync: {syncStatusLabel}</p>
               <p className="mt-1 text-xs text-slate-300">Cue: {cueLabel}</p>
               <p className="mt-1 text-xs text-slate-300">Page: {pageLabel}</p>
               <div className="mt-2 h-2 w-full overflow-hidden rounded bg-slate-800">
@@ -1499,7 +2081,17 @@ function App() {
               </div>
               {waitingForOffset ? (
                 <p className="mt-2 text-xs text-amber-300">
-                  Waiting for offset start at {lyricsStartOffsetSec.toFixed(1)}s
+                  Waiting for offset start at {textStartOffsetSec.toFixed(1)}s
+                </p>
+              ) : null}
+              {syncMessage ? (
+                <p className="mt-2 text-xs text-slate-400">{syncMessage}</p>
+              ) : null}
+              {alignmentResultState?.quality?.matchedRatio != null &&
+              syncMode === "auto" ? (
+                <p className="mt-1 text-xs text-slate-500">
+                  Match quality:{" "}
+                  {Math.round(alignmentResultState.quality.matchedRatio * 100)}%
                 </p>
               ) : null}
               {previewError ? (
@@ -1534,7 +2126,9 @@ function App() {
                 <div className="pointer-events-none absolute inset-0 grid place-items-center bg-slate-950/35 text-center">
                   <p className="rounded-md bg-slate-900/70 px-3 py-2 text-xs font-semibold text-slate-200">
                     {previewState === "loading"
-                      ? "Loading audio metadata..."
+                      ? syncStatus === "analyzing"
+                        ? "Analyzing speech alignment..."
+                        : "Loading audio metadata..."
                       : "Click Preview to start rendering"}
                   </p>
                 </div>
