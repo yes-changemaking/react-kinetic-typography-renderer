@@ -357,6 +357,8 @@ function App() {
   const previewTimeLabel = `${formatTime(playheadSeconds)} / ${formatTime(
     durationSeconds
   )}`;
+  const previewProgressPercent =
+    durationSeconds > 0 ? clamp01(playheadSeconds / durationSeconds) * 100 : 0;
   const exportStateLabel = EXPORT_STATE_LABELS[exportState] ?? "Unknown";
 
   const clearExportArtifact = useCallback(() => {
@@ -484,6 +486,43 @@ function App() {
     [animationStyle, scriptText]
   );
 
+  const runSilentPreviewLoop = useCallback(
+    (duration, previewSessionId) => {
+      setPreviewState("playing");
+      drawFrame(0, duration, { isPlaying: true, showHud: true });
+      fallbackStartTimeRef.current = performance.now();
+
+      const stepWithoutAudio = (now) => {
+        if (previewSessionId !== previewSessionRef.current) {
+          animationFrameRef.current = null;
+          return;
+        }
+
+        const elapsedSeconds = (now - fallbackStartTimeRef.current) / 1000;
+        const clampedTime = Math.min(elapsedSeconds, duration);
+
+        drawFrame(clampedTime, duration, { isPlaying: true, showHud: true });
+
+        if (now - lastUiSyncRef.current >= 120 || clampedTime >= duration) {
+          setPlayheadSeconds(clampedTime);
+          lastUiSyncRef.current = now;
+        }
+
+        if (clampedTime >= duration) {
+          setPreviewState("ended");
+          drawFrame(duration, duration, { isPlaying: false, showHud: true });
+          animationFrameRef.current = null;
+          return;
+        }
+
+        animationFrameRef.current = requestAnimationFrame(stepWithoutAudio);
+      };
+
+      animationFrameRef.current = requestAnimationFrame(stepWithoutAudio);
+    },
+    [drawFrame]
+  );
+
   const handlePreview = useCallback(async () => {
     if (isExporting) return;
 
@@ -505,40 +544,7 @@ function App() {
     if (!audioFile) {
       const fallbackDuration = Math.min(Math.max(scriptText.length / 14, 3), 24);
       setDurationSeconds(fallbackDuration);
-      setPreviewState("playing");
-      drawFrame(0, fallbackDuration, { isPlaying: true, showHud: true });
-      fallbackStartTimeRef.current = performance.now();
-
-      const stepWithoutAudio = (now) => {
-        if (previewSessionId !== previewSessionRef.current) {
-          animationFrameRef.current = null;
-          return;
-        }
-
-        const elapsedSeconds = (now - fallbackStartTimeRef.current) / 1000;
-        const clampedTime = Math.min(elapsedSeconds, fallbackDuration);
-
-        drawFrame(clampedTime, fallbackDuration, { isPlaying: true, showHud: true });
-
-        if (now - lastUiSyncRef.current >= 120 || clampedTime >= fallbackDuration) {
-          setPlayheadSeconds(clampedTime);
-          lastUiSyncRef.current = now;
-        }
-
-        if (clampedTime >= fallbackDuration) {
-          setPreviewState("ended");
-          drawFrame(fallbackDuration, fallbackDuration, {
-            isPlaying: false,
-            showHud: true,
-          });
-          animationFrameRef.current = null;
-          return;
-        }
-
-        animationFrameRef.current = requestAnimationFrame(stepWithoutAudio);
-      };
-
-      animationFrameRef.current = requestAnimationFrame(stepWithoutAudio);
+      runSilentPreviewLoop(fallbackDuration, previewSessionId);
       return;
     }
 
@@ -564,9 +570,24 @@ function App() {
       setDurationSeconds(duration);
       drawFrame(0, duration, { isPlaying: false, showHud: true });
 
-      await audio.play();
+      let playbackStarted = false;
+      try {
+        await audio.play();
+        playbackStarted = true;
+      } catch (playbackError) {
+        setPreviewError(
+          playbackError instanceof Error
+            ? `${playbackError.message} Running visual-only preview.`
+            : "Audio playback was blocked. Running visual-only preview."
+        );
+      }
 
       if (previewSessionId !== previewSessionRef.current) {
+        return;
+      }
+
+      if (!playbackStarted) {
+        runSilentPreviewLoop(duration, previewSessionId);
         return;
       }
 
@@ -614,7 +635,14 @@ function App() {
         error instanceof Error ? error.message : "Preview could not be started."
       );
     }
-  }, [audioFile, drawFrame, isExporting, scriptText, stopPreview]);
+  }, [
+    audioFile,
+    drawFrame,
+    isExporting,
+    runSilentPreviewLoop,
+    scriptText,
+    stopPreview,
+  ]);
 
   const handleExport = useCallback(async () => {
     if (isExporting) return;
@@ -985,12 +1013,12 @@ function App() {
               </p>
             </div>
 
-            <div className="mt-6 flex gap-3">
+            <div className="mt-6 flex flex-wrap gap-3">
               <button
                 type="button"
                 onClick={handlePreview}
                 disabled={previewButtonDisabled}
-                className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
+                className="min-w-[120px] rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {previewState === "playing" ? "Restart Preview" : "Preview"}
               </button>
@@ -998,14 +1026,14 @@ function App() {
                 type="button"
                 onClick={handleExport}
                 disabled={exportButtonDisabled}
-                className="rounded-xl bg-orange-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-60"
+                className="min-w-[120px] rounded-xl bg-orange-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {isExporting ? "Exporting..." : "Export Video"}
               </button>
               <button
                 type="button"
                 onClick={handleReset}
-                className="rounded-xl border border-slate-600 px-4 py-2 text-sm font-semibold text-slate-200 hover:border-slate-400 hover:text-white"
+                className="min-w-[120px] rounded-xl border border-slate-600 px-4 py-2 text-sm font-semibold text-slate-200 hover:border-slate-400 hover:text-white"
               >
                 Reset
               </button>
@@ -1021,11 +1049,17 @@ function App() {
               </a>
             ) : null}
 
-            <div className="mt-4 rounded-lg border border-slate-700/70 bg-slate-950/70 px-3 py-2 text-xs text-slate-300">
-              <p>Preview: {previewStateLabel}</p>
-              <p className="mt-1">Timeline: {previewTimeLabel}</p>
+            <div className="mt-4 rounded-lg border border-cyan-900/60 bg-slate-950/70 px-3 py-3 text-sm text-slate-200">
+              <p className="font-semibold text-cyan-300">Preview: {previewStateLabel}</p>
+              <p className="mt-1 text-xs text-slate-300">Timeline: {previewTimeLabel}</p>
+              <div className="mt-2 h-2 w-full overflow-hidden rounded bg-slate-800">
+                <div
+                  className="h-full bg-cyan-400 transition-all"
+                  style={{ width: `${previewProgressPercent}%` }}
+                />
+              </div>
               {previewError ? (
-                <p className="mt-2 text-red-300">{previewError}</p>
+                <p className="mt-2 text-xs text-red-300">{previewError}</p>
               ) : null}
             </div>
 
@@ -1052,6 +1086,15 @@ function App() {
                 width={CANVAS_WIDTH}
                 height={CANVAS_HEIGHT}
               />
+              {(previewState === "idle" || previewState === "loading") && (
+                <div className="pointer-events-none absolute inset-0 grid place-items-center bg-slate-950/35 text-center">
+                  <p className="rounded-md bg-slate-900/70 px-3 py-2 text-xs font-semibold text-slate-200">
+                    {previewState === "loading"
+                      ? "Loading audio metadata..."
+                      : "Click Preview to start rendering"}
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         </section>
